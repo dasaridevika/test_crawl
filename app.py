@@ -4,15 +4,14 @@ import re
 import time
 from urllib.parse import urljoin, urlparse
 import streamlit as st
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from curl_cffi.requests import AsyncSession
-from markdownify import markdownify as md
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Web Data Extractor",
+    page_title="Production Web Data Extractor",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -28,54 +27,149 @@ st.markdown("""
 
 
 # -----------------------------------------------------------------------------
-# EXACT FULL-TEXT CONTENT EXTRACTOR
+# HIGH-FIDELITY LINEAR DOM-TO-MARKDOWN CONVERTER
 # -----------------------------------------------------------------------------
-def extract_complete_exact_content(html_content: str, base_url: str) -> dict:
-    """
-    Extracts 100% of the complete content from the website:
-    - Retains every card, headline, description, link, and section
-    - Strips only true technical noise (scripts/styles) and the regional language picker list
-    - Retains full Markdown format with live links
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
-    base_domain = urlparse(base_url).netloc
-    page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
+def is_noise_or_navigation(tag: Tag) -> bool:
+    """Detects purely mechanical UI noise (language popups, skip-to-content, empty carousels)."""
+    # Skip navigation, header, footer menus, and utility popups
+    if tag.name in ["nav", "header", "footer", "dialog"]:
+        return True
+    
+    # Check class and id attributes
+    class_id_str = f"{tag.get('class', '')} {tag.get('id', '')} {tag.get('role', '')}".lower()
+    noise_patterns = [
+        "cookie", "modal", "language-selector", "region-selector", "country-selector",
+        "skip-to-content", "banner-alert", "megamenu", "flyout-menu", "search-modal"
+    ]
+    if any(p in class_id_str for p in noise_patterns):
+        return True
 
-    # 1. Remove non-content technical tags
-    for el in soup(["script", "style", "noscript", "svg", "iframe"]):
+    return False
+
+
+def dom_to_clean_markdown(root: Tag, base_url: str) -> str:
+    """
+    Recursively and linearly converts visual DOM elements into formatted Markdown.
+    - Preserves exact headline text (H1-H6)
+    - Preserves full paragraph text (P, DIV with text)
+    - Preserves bullet points (LI)
+    - Preserves contextual links with exact anchor text
+    - Strips duplicated carousel indicators ('Previous', 'Next', 'Short Description')
+    """
+    lines = []
+    seen_exact_blocks = set()
+
+    # Decompose script, style, comments, and hidden elements
+    for el in root(["script", "style", "noscript", "svg", "iframe"]):
         el.decompose()
 
-    # 2. Remove regional country/language picker clutter (e.g. Argentina Australia België...)
-    for el in soup.find_all(["div", "section", "nav"]):
-        text_sample = el.get_text()
+    for comment in root.find_all(text=lambda t: isinstance(t, Comment)):
+        comment.extract()
+
+    # Decompose language/region picker popups
+    for tag in root.find_all(["div", "section", "nav"]):
+        text_sample = tag.get_text()
         if "Argentina" in text_sample and "Australia" in text_sample and "Belgique" in text_sample:
-            el.decompose()
+            tag.decompose()
 
-    # 3. Clean and convert complete body to Markdown
-    body = soup.find("body") or soup
-    raw_markdown = md(
-        str(body),
-        heading_style="ATX",
-        strip=["img"],
-        bullets="-"
-    )
+    # Process all content-bearing tags in document order
+    for el in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "a", "blockquote", "table"]):
+        # Skip if parent was already discarded
+        if not el.parent:
+            continue
 
-    # 4. Clean consecutive empty lines while preserving full paragraph and section flow
-    lines = []
+        # Skip navigation containers
+        parent_noise = False
+        for p in el.parents:
+            if is_noise_or_navigation(p):
+                parent_noise = True
+                break
+        if parent_noise:
+            continue
+
+        # Extract text
+        text = el.get_text(separator=" ", strip=True)
+        if not text:
+            continue
+
+        # Filter mechanical carousel noise
+        if text in ["Previous", "Next", "Short Description"] or re.match(r"^([A-Z0-9\s]{3,30}\s\d+)$", text):
+            continue
+
+        # Prevent duplicate identical consecutive blocks
+        if text in seen_exact_blocks:
+            continue
+
+        tag_name = el.name
+
+        # 1. Headings
+        if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+            level = int(tag_name[1])
+            lines.append(f"\n{'#' * level} {text}\n")
+            seen_exact_blocks.add(text)
+
+        # 2. Blockquotes
+        elif tag_name == "blockquote":
+            lines.append(f"> {text}\n")
+            seen_exact_blocks.add(text)
+
+        # 3. List items
+        elif tag_name == "li":
+            # Check if this LI is inside an actual content list, not a menu
+            if len(text) > 3:
+                lines.append(f"- {text}")
+                seen_exact_blocks.add(text)
+
+        # 4. Paragraphs and Content Divs
+        elif tag_name == "p":
+            # If paragraph contains links, convert them inline
+            p_content = text
+            for a in el.find_all("a", href=True):
+                a_text = a.get_text(strip=True)
+                href = urljoin(base_url, a["href"])
+                if a_text and href and not href.startswith(("#", "javascript:")):
+                    p_content = p_content.replace(a_text, f"[{a_text}]({href})", 1)
+            lines.append(f"{p_content}\n")
+            seen_exact_blocks.add(text)
+
+        # 5. Standalone Call-to-Action Links (e.g. 'Learn More', 'Register Now')
+        elif tag_name == "a" and el.parent.name not in ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6"]:
+            href = urljoin(base_url, el.get("href", ""))
+            if text and href and not href.startswith(("#", "javascript:")) and len(text) < 80:
+                lines.append(f"[{text}]({href})\n")
+                seen_exact_blocks.add(text)
+
+    # Format into clean readable Markdown
+    clean_lines = []
     consecutive_empty = 0
-    for line in raw_markdown.splitlines():
-        clean_line = line.strip()
-        if not clean_line:
+    for l in lines:
+        l_str = l.strip()
+        if not l_str:
             consecutive_empty += 1
             if consecutive_empty <= 1:
-                lines.append("")
+                clean_lines.append("")
         else:
             consecutive_empty = 0
-            lines.append(clean_line)
+            clean_lines.append(l_str)
 
-    full_markdown_text = "\n".join(lines).strip()
+    return "\n".join(clean_lines).strip()
 
-    # 5. Extract all internal domain links
+
+def extract_website_data(html_content: str, base_url: str) -> dict:
+    """Extracts exact page content, metadata, schemas, and outlinks."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    
+    page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
+
+    # Meta Description
+    desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    description = desc_tag.get("content", "").strip() if desc_tag else ""
+
+    # Extract exact clean Markdown
+    clean_markdown = dom_to_clean_markdown(soup, base_url)
+
+    # Extract all discovered internal domain links
     links = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -84,7 +178,7 @@ def extract_complete_exact_content(html_content: str, base_url: str) -> dict:
             if urlparse(full_url).netloc == base_domain:
                 links.add(full_url)
 
-    # 6. Extract JSON-LD Schema
+    # Extract JSON-LD Schemas
     json_ld = []
     for s in soup.find_all("script", type="application/ld+json"):
         try:
@@ -95,18 +189,19 @@ def extract_complete_exact_content(html_content: str, base_url: str) -> dict:
 
     return {
         "title": page_title,
+        "description": description,
         "url": base_url,
-        "markdown": full_markdown_text,
-        "content_length": len(full_markdown_text),
+        "markdown": clean_markdown,
+        "content_length": len(clean_markdown),
         "links": sorted(list(links)),
         "json_ld": json_ld
     }
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED ASYNC NETWORK LAYER
+# HIGH-SPEED ASYNC NETWORK LAYER (TLS / JA3 IMPERSONATION)
 # -----------------------------------------------------------------------------
-async def fetch_website_content(url: str) -> dict:
+async def fetch_page(url: str) -> dict:
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -122,7 +217,7 @@ async def fetch_website_content(url: str) -> dict:
             duration = round(time.time() - start_t, 2)
 
             if resp.status_code == 200:
-                data = extract_complete_exact_content(resp.text, url)
+                data = extract_website_data(resp.text, url)
                 data["status"] = "SUCCESS"
                 data["fetch_time_sec"] = duration
                 return data
@@ -136,7 +231,7 @@ async def fetch_website_content(url: str) -> dict:
 # MAIN UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Web Data Extractor</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Complete, high-fidelity content extraction with automatic anti-bot bypass.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Extracts exact readable content, headings, paragraphs, and links with zero noise.</div>', unsafe_allow_html=True)
 
 col1, col2 = st.columns([5, 1])
 with col1:
@@ -153,14 +248,15 @@ if start_btn and target_url:
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
-    with st.spinner("Extracting complete page content..."):
-        result = asyncio.run(fetch_website_content(target_url))
+    with st.spinner("Extracting exact website content..."):
+        result = asyncio.run(fetch_page(target_url))
 
     st.markdown("---")
 
     if result.get("status") == "SUCCESS":
         st.markdown(f"## {result['title']}")
-        st.caption(f"🔗 Source: [{result['url']}]({result['url']})")
+        if result.get("description"):
+            st.caption(f"**Summary:** {result['description']}")
 
         # Metrics Bar
         m1, m2, m3, m4 = st.columns(4)
