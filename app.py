@@ -95,14 +95,28 @@ def calculate_url_priority(url: str, depth: int) -> float:
     return score
 
 
+def get_root_domain(netloc: str) -> str:
+    """Extracts apex root domain (e.g. 'nvidia.com' from 'www.nvidia.com')."""
+    parts = netloc.lower().split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return netloc.lower()
+
+
 def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> str | None:
-    """Normalizes URLs and enforces strict same-domain boundaries."""
+    """Normalizes URLs and enforces apex root domain boundaries (allowing blogs.*, news.*, docs.*)."""
     if not raw_url or raw_url.startswith(("#", "javascript:", "mailto:", "tel:")):
         return None
     full_url = urljoin(current_url, raw_url).split("#")[0].rstrip("/")
     parsed = urlparse(full_url)
-    if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
-        return full_url
+    
+    root_base = get_root_domain(base_domain)
+    target_netloc = parsed.netloc.lower()
+    
+    if (target_netloc == base_domain or target_netloc.endswith("." + root_base) or target_netloc == root_base) and parsed.scheme in ("http", "https"):
+        # Ignore binary or media file extensions
+        if not full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe")):
+            return full_url
     return None
 
 
