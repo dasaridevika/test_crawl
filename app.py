@@ -95,6 +95,30 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     return None
 
 
+def sanitize_markdown_content(text: str) -> str:
+    """Removes UI icon artifacts, menu tokens, and mega-footer country dumps."""
+    if not text:
+        return ""
+    ui_noise_patterns = [
+        r"(?:Menu\s+icon|Close\s+icon|Caret\s+(?:down|up|right|left)\s+icon|Accordion is (?:closed|open)[^.\n]*\.)+",
+        r"Click to (?:expand|collapse)[^\n.]*\.",
+        r"Shopping Cart Click to see cart items",
+        r"Search icon Click to search",
+        r"<util:I18n[^>]*>",
+        r"\b(?:Previous|Next)\s+Short Description\b",
+        r"Short Description(?:\n[A-Za-z0-9\s_-]+)+",
+    ]
+    cleaned = text
+    for pat in ui_noise_patterns:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+
+    # Clean country selector dump at the end
+    cleaned = re.sub(r"Select Location\s+The Americas[\s\S]*?(?=(\n\n|\Z))", "", cleaned, flags=re.IGNORECASE)
+    # Clean excessive blank lines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
 # -----------------------------------------------------------------------------
 # MULTI-MODAL CONTENT EXTRACTOR
 # -----------------------------------------------------------------------------
@@ -104,12 +128,13 @@ def extract_multimodal_data(html_content: str, raw_markdown: str | None, url: st
 
     # 1. Clean Markdown Content
     if raw_markdown and len(raw_markdown.strip()) > 50:
-        markdown_content = raw_markdown
+        markdown_content = sanitize_markdown_content(raw_markdown)
     else:
         for el in soup(["script", "style", "noscript", "svg", "iframe"]):
             el.decompose()
         body = soup.find("body") or soup
-        markdown_content = markdownify.markdownify(str(body), heading_style="ATX", strip=['script', 'style'])
+        raw_md = markdownify.markdownify(str(body), heading_style="ATX", strip=['script', 'style'])
+        markdown_content = sanitize_markdown_content(raw_md)
 
     # 2. Extract HTML Data Tables into DataFrames
     extracted_tables = []
