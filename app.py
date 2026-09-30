@@ -175,9 +175,9 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
         f"{base_origin}/robots.txt"
     ]
 
-    for s_url in candidate_sitemaps[:5]:
+    for s_url in candidate_sitemaps[:4]:
         try:
-            resp = await session.get(s_url, timeout=6)
+            resp = await session.get(s_url, timeout=5)
             if resp.status_code == 200:
                 if s_url.endswith(".txt"):
                     for line in resp.text.splitlines():
@@ -186,9 +186,9 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
                             candidate_sitemaps.append(s_target)
                 elif "<urlset" in resp.text or "<sitemapindex" in resp.text:
                     locs = re.findall(r"<loc>(.*?)</loc>", resp.text, re.IGNORECASE)
-                    for loc in locs[:3000]:
+                    for loc in locs[:1000]:
                         loc = loc.strip()
-                        if loc.endswith(".xml") and len(candidate_sitemaps) < 8:
+                        if loc.endswith(".xml") and len(candidate_sitemaps) < 6:
                             candidate_sitemaps.append(loc)
                         else:
                             clean_loc = normalize_target_url(loc, base_domain, seed_url, seed_locale)
@@ -205,7 +205,6 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
 # -----------------------------------------------------------------------------
 def extract_editorial_markdown(html_content: str, url: str) -> str:
     """Extracts complete clean editorial copy, unwrapping card link blocks and removing UI clutter."""
-    # First test if Trafilatura extracts complete long-form article body
     if TRAFILATURA_AVAILABLE:
         try:
             traf_md = trafilatura.extract(
@@ -410,18 +409,18 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED PARALLEL WORKER POOL ENGINE (32-48 CONCURRENT HTTP/2 STREAMS)
+# HIGH-SPEED PARALLEL WORKER POOL ENGINE (32 CONCURRENT HTTP/2 STREAMS)
 # -----------------------------------------------------------------------------
 async def crawl_entire_domain_parallel_turbo(
     seed_url: str,
     status_placeholder,
     metric_placeholders: tuple,
-    concurrency: int = 32,
-    max_pages_cap: int = 5000
+    target_limit: int = 100,
+    concurrency: int = 32
 ) -> list[dict]:
     """
-    Ultra-high-throughput parallel crawler utilizing 32-48 concurrent HTTP/2 stream workers.
-    Achieves 30-60+ pages/second and extracts full deep site content rapidly.
+    Ultra-high-throughput parallel crawler utilizing 32 concurrent HTTP/2 stream workers.
+    Fast execution finishing within seconds.
     """
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
@@ -443,10 +442,10 @@ async def crawl_entire_domain_parallel_turbo(
 
     start_time = time.time()
 
-    async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=20) as session:
+    async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=12) as session:
         # Step 1: Rapid Sitemap & Robots Preloader
         if status_placeholder:
-            status_placeholder.markdown("🔍 **Preloading full site structure** via `sitemap.xml` & `robots.txt`...")
+            status_placeholder.markdown("🔍 **Preloading indexed pages** via `sitemap.xml` & `robots.txt`...")
 
         sitemap_urls = await discover_sitemap_urls(session, sanitized_seed, base_domain, seed_locale)
         for s_url in sitemap_urls:
@@ -455,12 +454,12 @@ async def crawl_entire_domain_parallel_turbo(
                 heapq.heappush(frontier, FrontierItem(90.0, s_url, 1))
 
         if status_placeholder:
-            status_placeholder.markdown(f"🚀 **Turbo Parallel Engine Running** ({concurrency} parallel workers active)...")
+            status_placeholder.markdown(f"🚀 **Parallel Turbo Crawling Active** ({concurrency} parallel workers fetching top pages)...")
 
         # Step 2: High-Speed Concurrent Batch Traversal
-        while frontier and len(results) < max_pages_cap:
+        while frontier and len(results) < target_limit:
             batch: list[FrontierItem] = []
-            while frontier and len(batch) < concurrency and (len(results) + len(batch)) < max_pages_cap:
+            while frontier and len(batch) < concurrency and (len(results) + len(batch)) < target_limit:
                 batch.append(heapq.heappop(frontier))
 
             if not batch:
@@ -496,14 +495,14 @@ async def crawl_entire_domain_parallel_turbo(
             speed = round(len(results) / elapsed, 1)
             total_words = sum(p["word_count"] for p in results)
 
-            m1_box.metric("Pages Extracted", len(results))
-            m2_box.metric("In Frontier Queue", len(frontier))
+            m1_box.metric("Pages Extracted", f"{len(results)} / {target_limit}")
+            m2_box.metric("In Queue", len(frontier))
             m3_box.metric("Words Extracted", f"{total_words:,}")
-            m4_box.metric("Turbo Speed", f"{speed} pages/sec")
+            m4_box.metric("Speed", f"{speed} pages/sec")
 
             if status_placeholder:
                 status_placeholder.markdown(
-                    f"⚡ **Turbo Crawling Active:** Extracted `{len(results)}` pages (`{total_words:,}` words) | `{len(frontier)}` in queue | `{speed} pages/sec`"
+                    f"⚡ **Parallel Extraction:** `{len(results)}/{target_limit}` pages (`{total_words:,}` words) | `{elapsed}s` elapsed ({speed} p/s)"
                 )
 
     return results
@@ -513,32 +512,32 @@ async def crawl_entire_domain_parallel_turbo(
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Enterprise Parallel Web Crawler & Data Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Turbo Multi-Worker Parallel Engine — Crawls entire domains at 30–60+ pages/second with zero depth restrictions.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Turbo Multi-Worker Parallel Engine — High-speed deep site extraction delivering results in seconds.</div>', unsafe_allow_html=True)
 
 # Engine status banner
 if CURL_CFFI_AVAILABLE:
-    st.success("✅ **32-Stream Parallel Turbo Engine Ready** (Chrome124 Stealth TLS + HTTP/2 Multiplexing + Real-time Frontier)")
+    st.success("✅ **32-Stream Parallel Turbo Engine Active** (Chrome124 Stealth TLS + HTTP/2 Multiplexing + Instant Extraction)")
 else:
     st.info("⚡ Standard Engine Ready.")
 
-col_url, col_conc, col_btn = st.columns([4, 1.8, 1.5])
+col_url, col_scope, col_btn = st.columns([3.5, 2.2, 1.5])
 with col_url:
     target_url = st.text_input(
         "Target Website URL",
-        value="https://quotes.toscrape.com/js/",
+        value="https://www.nvidia.com/en-in/",
         placeholder="https://example.com",
         label_visibility="collapsed"
     )
-with col_conc:
-    concurrency_setting = st.selectbox(
-        "Parallel Concurrency",
-        options=[16, 32, 48],
+with col_scope:
+    crawl_preset = st.selectbox(
+        "Crawl Scope",
+        options=[25, 100, 300, 1000],
         index=1,
-        format_func=lambda c: f"🚀 {c} Parallel Workers (Turbo)",
+        format_func=lambda n: f"⚡ {n} Pages (~{3 if n<=25 else 12 if n<=100 else 30 if n<=300 else 90}s) {'(Fast)' if n==25 else '(Recommended)' if n==100 else '(Deep)'}",
         label_visibility="collapsed"
     )
 with col_btn:
-    start_btn = st.button("⚡ Start Turbo Crawl", type="primary", use_container_width=True)
+    start_btn = st.button("⚡ Start Fast Crawl", type="primary", use_container_width=True)
 
 # Live crawling execution container
 if start_btn and target_url:
@@ -561,14 +560,14 @@ if start_btn and target_url:
             seed_url=target_url,
             status_placeholder=status_box,
             metric_placeholders=(m1_slot, m2_slot, m3_slot, m4_slot),
-            concurrency=concurrency_setting,
-            max_pages_cap=5000
+            target_limit=crawl_preset,
+            concurrency=32
         )
     )
 
     total_duration = round(time.time() - start_total_t, 2)
     speed = round(len(crawled_data) / max(0.1, total_duration), 1)
-    status_box.success(f"🎉 **Parallel Turbo Crawl Completed:** Extracted {len(crawled_data)} pages across the domain in {total_duration}s ({speed} pages/sec)!")
+    status_box.success(f"🎉 **Crawl Completed in {total_duration}s!** Extracted {len(crawled_data)} pages ({sum(p['word_count'] for p in crawled_data):,} words) at {speed} pages/sec.")
     st.session_state["crawled_data"] = crawled_data
 
 
@@ -598,19 +597,19 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
     st.markdown("---")
 
     # Interactive Spotlight / High-Word-Count Articles Bar
-    rich_articles = sorted([p for p in crawled_data if p["word_count"] > 500], key=lambda x: x["word_count"], reverse=True)
+    rich_articles = sorted([p for p in crawled_data if p["word_count"] > 400], key=lambda x: x["word_count"], reverse=True)
     if rich_articles:
-        st.markdown("### 🔥 Deep Content & Article Spotlight")
-        st.caption(f"Found **{len(rich_articles)}** in-depth full-text articles and documentation pages ({sum(p['word_count'] for p in rich_articles):,} words):")
+        st.markdown("### 🔥 In-Depth Article Spotlight")
+        st.caption(f"Top long-form articles discovered ({len(rich_articles)} articles, {sum(p['word_count'] for p in rich_articles):,} total words):")
         
         top_cols = st.columns(min(4, len(rich_articles)))
         for i, top_p in enumerate(rich_articles[:4]):
             with top_cols[i]:
                 st.markdown(f"""
                 <div class="spotlight-card">
-                    <b>📄 {top_p['title'][:45]}</b><br>
-                    <small>📝 {top_p['word_count']:,} words | ⏱️ {top_p.get('fetch_time_sec', 0)}s</small><br>
-                    <small>🔗 <a href="{top_p['url']}" target="_blank">View Live Page</a></small>
+                    <b>📄 {top_p['title'][:40]}</b><br>
+                    <small>📝 <b>{top_p['word_count']:,} words</b> | ⏱️ {top_p.get('fetch_time_sec', 0)}s</small><br>
+                    <small>🔗 <a href="{top_p['url']}" target="_blank">View Live URL</a></small>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -635,13 +634,13 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
     # Export & Search Bar
     exp_col1, exp_col2 = st.columns([4, 1])
     with exp_col1:
-        search_query = st.text_input("🔍 Search across all crawled pages:", placeholder="Filter by keyword (e.g. quantum, blackwell, pricing, safety, agents)...", label_visibility="collapsed")
+        search_query = st.text_input("🔍 Search across all crawled pages:", placeholder="Filter by keyword (e.g. quantum, blackwell, safety, agents)...", label_visibility="collapsed")
     with exp_col2:
         export_payload = json.dumps([{k: v for k, v in p.items() if k != "tables"} for p in crawled_data], indent=2)
         st.download_button(
-            "📦 Export Entire Dataset (JSON)",
+            "📦 Export Full Dataset (JSON)",
             data=export_payload,
-            file_name="turbo_parallel_site_crawl.json",
+            file_name="turbo_crawl_dataset.json",
             mime="application/json",
             use_container_width=True
         )
