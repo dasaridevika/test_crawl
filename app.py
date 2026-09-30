@@ -9,41 +9,11 @@ import sys
 import time
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
+import httpx
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 import markdownify
-
-# -----------------------------------------------------------------------------
-# SAFE IMPORTS & ENVIRONMENT SETUP
-# -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def setup_playwright_environment():
-    """Ensures Chromium binary is downloaded for Playwright/Crawl4AI on Streamlit Cloud."""
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False,
-            timeout=60,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        pass
-
-try:
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-    CRAWL4AI_AVAILABLE = True
-    setup_playwright_environment()
-except ImportError:
-    CRAWL4AI_AVAILABLE = False
-
-try:
-    from curl_cffi.requests import AsyncSession as CffiAsyncSession
-    CURL_CFFI_AVAILABLE = True
-except ImportError:
-    CURL_CFFI_AVAILABLE = False
-
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
@@ -155,7 +125,7 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str, seed_
 # -----------------------------------------------------------------------------
 # SITEMAP DISCOVERY HELPER
 # -----------------------------------------------------------------------------
-async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base_domain: str, seed_locale: str | None) -> set[str]:
+async def discover_sitemap_urls(client: httpx.AsyncClient, seed_url: str, base_domain: str, seed_locale: str | None) -> set[str]:
     """Attempts to discover indexed URLs from sitemap.xml and robots.txt."""
     discovered = set()
     parsed = urlparse(seed_url)
@@ -169,7 +139,7 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
 
     for s_url in candidate_sitemaps[:4]:
         try:
-            resp = await session.get(s_url, timeout=5)
+            resp = await client.get(s_url, timeout=5.0)
             if resp.status_code == 200:
                 if s_url.endswith(".txt"):
                     for line in resp.text.splitlines():
@@ -356,15 +326,18 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED PARALLEL WORKER POOL ENGINE
+# STANDARD DIRECT HTTP ASYNC CRAWLER (NO BROWSER IMPERSONATION)
 # -----------------------------------------------------------------------------
-async def crawl_structured_dataset_parallel(
+async def crawl_structured_dataset_direct(
     seed_url: str,
     status_placeholder,
     metric_placeholders: tuple,
     target_limit: int = 100,
-    concurrency: int = 32
+    concurrency: int = 24
 ) -> list[dict]:
+    """
+    Standard, transparent async HTTP client crawler using HTTP/2 connection pooling with zero browser impersonation.
+    """
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
     sanitized_seed = sanitize_url(seed_url)
@@ -377,26 +350,28 @@ async def crawl_structured_dataset_parallel(
     records: list[dict] = []
     heapq.heappush(frontier, FrontierItem(100.0, sanitized_seed, 0))
 
+    # Standard transparent crawler headers
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "EnterpriseDataEngine/1.0 (+https://example.com/bot; Web Data Extraction Engine)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
+    limits = httpx.Limits(max_connections=50, max_keepalive_connections=30)
     start_time = time.time()
 
-    async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=12) as session:
+    async with httpx.AsyncClient(headers=headers, http2=True, timeout=12.0, limits=limits, follow_redirects=True) as client:
         if status_placeholder:
             status_placeholder.markdown("🔍 **Preloading indexed domain pages** via `sitemap.xml` & `robots.txt`...")
 
-        sitemap_urls = await discover_sitemap_urls(session, sanitized_seed, base_domain, seed_locale)
+        sitemap_urls = await discover_sitemap_urls(client, sanitized_seed, base_domain, seed_locale)
         for s_url in sitemap_urls:
             if s_url not in visited:
                 visited.add(s_url)
                 heapq.heappush(frontier, FrontierItem(90.0, s_url, 1))
 
         if status_placeholder:
-            status_placeholder.markdown(f"🚀 **Parallel Dataset Extraction Active** ({concurrency} parallel workers)...")
+            status_placeholder.markdown(f"🚀 **Direct HTTP Parallel Extraction Active** ({concurrency} async streams)...")
 
         while frontier and len(records) < target_limit:
             batch: list[FrontierItem] = []
@@ -409,7 +384,7 @@ async def crawl_structured_dataset_parallel(
             async def fetch_page(item: FrontierItem):
                 t0 = time.time()
                 try:
-                    resp = await session.get(item.url)
+                    resp = await client.get(item.url)
                     dur = round(time.time() - t0, 2)
                     if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", "").lower():
                         data = extract_structured_record(resp.text, item.url, base_domain, seed_locale)
@@ -452,13 +427,9 @@ async def crawl_structured_dataset_parallel(
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Structured Dataset Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Extracts clean structured records (Title, Summary, Author, Date, Full Text, Headings, Images, Links) exportable to Excel, CSV, and JSON.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Direct Standard HTTP Crawler — Extracts clean structured records without browser impersonation, exportable to Excel, CSV, and JSON.</div>', unsafe_allow_html=True)
 
-# Engine status banner
-if CURL_CFFI_AVAILABLE:
-    st.success("✅ **32-Stream Parallel Dataset Engine Ready** (Chrome124 Stealth TLS + HTTP/2 Multiplexing + Clean Dataset Generator)")
-else:
-    st.info("⚡ Standard Engine Ready.")
+st.success("✅ **Standard Direct HTTP Client Active** (`httpx` HTTP/2 Connection Pool — Zero Browser Impersonation)")
 
 col_url, col_scope, col_btn = st.columns([3.5, 2.2, 1.5])
 with col_url:
@@ -495,12 +466,12 @@ if start_btn and target_url:
     start_total_t = time.time()
 
     dataset_records = asyncio.run(
-        crawl_structured_dataset_parallel(
+        crawl_structured_dataset_direct(
             seed_url=target_url,
             status_placeholder=status_box,
             metric_placeholders=(m1_slot, m2_slot, m3_slot, m4_slot),
             target_limit=crawl_preset,
-            concurrency=32
+            concurrency=24
         )
     )
 
@@ -538,7 +509,6 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
     # 📥 DATASET EXPORT SUITE (EXCEL, CSV, JSON)
     st.markdown("### 📥 Download Structured Dataset")
     
-    # Prepare export DataFrame
     tabular_df = pd.DataFrame([
         {
             "Title": r["Title"],
@@ -561,7 +531,6 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
     exp_c1, exp_c2, exp_c3 = st.columns(3)
     
     with exp_c1:
-        # Excel buffer
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
             tabular_df.to_excel(writer, index=False, sheet_name="Crawled_Dataset")
