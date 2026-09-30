@@ -3,6 +3,7 @@ import heapq
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from urllib.parse import urljoin, urlparse
@@ -12,10 +13,21 @@ import streamlit as st
 from bs4 import BeautifulSoup
 import markdownify
 
-# Safe imports for Crawl4AI and curl_cffi with zero-crash guarantee
+# -----------------------------------------------------------------------------
+# SAFE IMPORTS & ENVIRONMENT SETUP
+# -----------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def setup_playwright_environment():
+    """Ensures Chromium binary is downloaded for Playwright/Crawl4AI on Streamlit Cloud."""
+    try:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 try:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
     CRAWL4AI_AVAILABLE = True
+    setup_playwright_environment()
 except ImportError:
     CRAWL4AI_AVAILABLE = False
 
@@ -30,7 +42,7 @@ except ImportError:
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Adaptive Frontier Web Engine",
+    page_title="Adaptive Frontier Web Extractor",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -41,7 +53,6 @@ st.markdown("""
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
-    .status-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 0.85rem; font-weight: 600; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -205,7 +216,7 @@ async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, pro
     browser_config = BrowserConfig(
         headless=True,
         browser_type="chromium",
-        extra_args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+        extra_args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
     )
 
     crawler_run_config = CrawlerRunConfig(
@@ -229,7 +240,7 @@ async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, pro
         while frontier and len(results) < max_pages:
             item = heapq.heappop(frontier)
             if status_text:
-                status_text.text(f"⚡ [Crawl4AI] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+                status_text.text(f"⚡ [Crawl4AI Engine] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
 
             start_t = time.time()
             res = await crawler.arun(url=item.url, config=crawler_run_config)
@@ -275,7 +286,7 @@ async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, pr
         while frontier and len(results) < max_pages:
             item = heapq.heappop(frontier)
             if status_text:
-                status_text.text(f"🚀 [Fast TLS] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+                status_text.text(f"🚀 [Fast TLS Engine] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
 
             start_t = time.time()
             try:
@@ -310,9 +321,9 @@ st.markdown('<div class="sub-header">Advanced Priority-Queue Frontier Engine wit
 
 # Engine Status banner
 if CRAWL4AI_AVAILABLE:
-    st.success("✅ **Crawl4AI Dynamic Engine Active** (Full JS Rendering & Browser Automation)")
+    st.success("✅ **Crawl4AI Dynamic Engine Ready** (Playwright Browser + Dynamic JS Execution)")
 else:
-    st.info("⚡ **Fast Stealth TLS Engine Active** (`curl_cffi` Chrome124 Fingerprint). *Tip: If you want Crawl4AI on Streamlit Cloud, reboot your app via 'Manage app' -> '...' -> 'Reboot app' to finalize package installation.*")
+    st.info("⚡ **High-Speed Stealth TLS Engine Ready** (`curl_cffi` Chrome124 Fingerprint).")
 
 col1, col2 = st.columns([5, 1])
 with col1:
@@ -334,8 +345,9 @@ if start_btn and target_url:
     status.text("Initializing crawler session...")
 
     start_total_t = time.time()
+    crawled_data = []
 
-    # Execute with Crawl4AI if available, else smooth fallback
+    # Execute with Crawl4AI if available, with graceful fallback to Fast TLS
     if CRAWL4AI_AVAILABLE:
         try:
             crawled_data = asyncio.run(
@@ -348,7 +360,7 @@ if start_btn and target_url:
                 )
             )
         except Exception as err:
-            status.text("Crawl4AI browser initializing failed, switching to High-Speed TLS Engine...")
+            status.text("⚡ Fallback: Executing via High-Speed TLS Engine...")
             crawled_data = asyncio.run(
                 crawl_with_curl_cffi(
                     seed_url=target_url,
