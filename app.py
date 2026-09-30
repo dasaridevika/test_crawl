@@ -20,7 +20,13 @@ import markdownify
 def setup_playwright_environment():
     """Ensures Chromium binary is downloaded for Playwright/Crawl4AI on Streamlit Cloud."""
     try:
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            timeout=60,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
     except Exception:
         pass
 
@@ -37,12 +43,18 @@ try:
 except ImportError:
     CURL_CFFI_AVAILABLE = False
 
+try:
+    import trafilatura
+    TRAFILATURA_AVAILABLE = True
+except ImportError:
+    TRAFILATURA_AVAILABLE = False
+
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Adaptive Frontier Web Extractor",
+    page_title="Enterprise Web Crawler & Data Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -53,6 +65,7 @@ st.markdown("""
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
+    .metric-card { background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 8px; padding: 12px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -68,17 +81,16 @@ class FrontierItem:
         self.depth = depth
 
     def __lt__(self, other):
-        # Max-heap behavior
         return self.priority > other.priority
 
 
 def calculate_url_priority(url: str, depth: int) -> float:
-    """Heuristic scoring: prioritizes content paths and penalizes depth."""
+    """Heuristic scoring: prioritizes high-value content paths and penalizes depth."""
     score = 100.0 - (depth * 25.0)
-    valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/"]
+    valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/", "/case-studies/"]
     if any(k in url.lower() for k in valuable_keywords):
         score += 35.0
-    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms"]
+    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms", "/privacy"]
     if any(k in url.lower() for k in utility_keywords):
         score -= 20.0
     return score
@@ -95,29 +107,47 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     return None
 
 
-def extract_exact_structured_markdown(soup_root: BeautifulSoup, base_url: str) -> str:
-    """Compiles complete, clean, hierarchical Markdown containing all editorial copy and paragraphs."""
-    s = BeautifulSoup(str(soup_root), "html.parser")
+# -----------------------------------------------------------------------------
+# MULTI-MODAL CONTENT EXTRACTOR (TRAFILATURA + DOM HYBRID)
+# -----------------------------------------------------------------------------
+def extract_editorial_markdown(html_content: str, url: str) -> str:
+    """Extracts clean editorial copy using Trafilatura with DOM fallback."""
+    # 1. Try Trafilatura for clean article/text extraction
+    if TRAFILATURA_AVAILABLE:
+        try:
+            traf_md = trafilatura.extract(
+                html_content,
+                url=url,
+                output_format="markdown",
+                include_links=True,
+                include_images=False,
+                include_tables=True,
+                favor_precision=True
+            )
+            if traf_md and len(traf_md.strip()) > 120:
+                return traf_md.strip()
+        except Exception:
+            pass
 
-    # 1. Decompose noisy non-content structural tags
-    for el in s.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
+    # 2. Hybrid DOM Markdown Extraction
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # Remove non-content structural elements
+    for el in soup.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
         el.decompose()
 
-    # 2. Decompose UI modals, country selectors, and carousel indicator dots
     noise_matchers = [
-        "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control", 
-        "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer", 
+        "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control",
+        "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer",
         "country-selector", "location-selector", "sr-only", "region-selector"
     ]
-    for el in s.find_all(lambda e: e.name not in ["html", "body"] and any(m in str(e.get("class", "")).lower() or m in str(e.get("id", "")).lower() for m in noise_matchers)):
+    for el in soup.find_all(lambda e: e.name not in ["html", "body"] and any(m in str(e.get("class", "")).lower() or m in str(e.get("id", "")).lower() for m in noise_matchers)):
         el.decompose()
 
-    # 3. Convert all relative URLs to absolute URLs
-    for a in s.find_all("a", href=True):
-        a["href"] = urljoin(base_url, a["href"])
+    for a in soup.find_all("a", href=True):
+        a["href"] = urljoin(url, a["href"])
 
-    # 4. Extract full content with markdownify
-    body = s.find("body") or s
+    body = soup.find("body") or soup
     md = markdownify.markdownify(
         str(body),
         heading_style="ATX",
@@ -125,7 +155,6 @@ def extract_exact_structured_markdown(soup_root: BeautifulSoup, base_url: str) -
         strip=["script", "style", "button", "form", "nav", "svg", "img", "noscript", "iframe"]
     )
 
-    # 5. Clean residual UI noise tokens
     ui_noise = [
         r"Accordion is (?:closed|open)[^\n.]*\.",
         r"Click to (?:expand|collapse)[^\n.]*\.",
@@ -140,22 +169,17 @@ def extract_exact_structured_markdown(soup_root: BeautifulSoup, base_url: str) -
     for pat in ui_noise:
         md = re.sub(pat, "", md, flags=re.IGNORECASE)
 
-    # Clean excessive blank lines
-    md = re.sub(r"\n{3,}", "\n\n", md).strip()
-    return md
+    return re.sub(r"\n{3,}", "\n\n", md).strip()
 
 
-# -----------------------------------------------------------------------------
-# MULTI-MODAL CONTENT EXTRACTOR
-# -----------------------------------------------------------------------------
-def extract_multimodal_data(html_content: str, raw_markdown: str | None, url: str, base_domain: str) -> dict:
+def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> dict:
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
 
-    # 1. Exact Hierarchical Full Markdown Content
-    markdown_content = extract_exact_structured_markdown(soup, url)
+    # 1. Clean Markdown Text (Trafilatura + DOM Hybrid)
+    markdown_content = extract_editorial_markdown(html_content, url)
 
-    # 2. Extract HTML Data Tables into DataFrames
+    # 2. Extract HTML Data Tables and Definition Lists into DataFrames
     extracted_tables = []
     for idx, tbl in enumerate(soup.find_all("table"), start=1):
         try:
@@ -171,27 +195,43 @@ def extract_multimodal_data(html_content: str, raw_markdown: str | None, url: st
         except Exception:
             pass
 
-    # 3. Media Assets
+    # Extract Definition lists (<dl>) as key-value tables
+    for d_idx, dl in enumerate(soup.find_all("dl"), start=1):
+        dts = [dt.get_text(strip=True) for dt in dl.find_all("dt")]
+        dds = [dd.get_text(strip=True) for dd in dl.find_all("dd")]
+        if dts and len(dts) == len(dds):
+            df_dl = pd.DataFrame({"Key": dts, "Value": dds})
+            extracted_tables.append({
+                "id": f"Key-Value List #{d_idx}",
+                "rows": len(df_dl),
+                "columns": 2,
+                "dataframe": df_dl
+            })
+
+    # 3. High-Quality Media Assets (Exclude 1x1 pixels, base64, and SVGs)
     images = []
     seen_imgs = set()
     for img in soup.find_all("img", src=True):
         src = img["src"].strip()
         full_src = urljoin(url, src)
-        if full_src not in seen_imgs and not full_src.startswith("data:"):
-            seen_imgs.add(full_src)
-            images.append({
-                "src": full_src,
-                "alt": img.get("alt", "").strip() or "Image Asset"
-            })
+        # Filter out tracking pixels and base64 strings
+        if full_src.startswith(("http://", "https://")) and full_src not in seen_imgs:
+            if not any(noise in full_src.lower() for noise in ["pixel.gif", "spacer.gif", "blank.gif", "1x1"]):
+                seen_imgs.add(full_src)
+                images.append({
+                    "src": full_src,
+                    "alt": img.get("alt", "").strip() or "Image Asset"
+                })
 
-    # 4. SEO & Social Metadata
+    # 4. SEO, OpenGraph & JSON-LD Schemas
     meta_info = {
         "title": page_title,
         "description": "",
         "og_title": "",
         "og_description": "",
         "og_image": "",
-        "canonical": ""
+        "canonical": "",
+        "json_ld_schemas": []
     }
     for m in soup.find_all("meta"):
         name = m.get("name", "").lower()
@@ -211,6 +251,15 @@ def extract_multimodal_data(html_content: str, raw_markdown: str | None, url: st
     can = soup.find("link", rel="canonical")
     if can and can.get("href"):
         meta_info["canonical"] = urljoin(url, can["href"])
+
+    # Extract JSON-LD structured schemas
+    for s_tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            if s_tag.string:
+                parsed_schema = json.loads(s_tag.string.strip())
+                meta_info["json_ld_schemas"].append(parsed_schema)
+        except Exception:
+            pass
 
     # 5. Outlinks Discovery
     outlinks = []
@@ -291,7 +340,7 @@ async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, pro
             duration = round(time.time() - start_t, 2)
 
             if res.success:
-                page_data = extract_multimodal_data(res.html or "", res.markdown or "", item.url, base_domain)
+                page_data = extract_multimodal_data(res.html or "", item.url, base_domain)
                 page_data["status"] = "SUCCESS"
                 page_data["fetch_time_sec"] = duration
                 results.append(page_data)
@@ -337,7 +386,7 @@ async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, pr
                 resp = await session.get(item.url)
                 duration = round(time.time() - start_t, 2)
                 if resp.status_code == 200:
-                    page_data = extract_multimodal_data(resp.text, None, item.url, base_domain)
+                    page_data = extract_multimodal_data(resp.text, item.url, base_domain)
                     page_data["status"] = "SUCCESS"
                     page_data["fetch_time_sec"] = duration
                     results.append(page_data)
@@ -360,12 +409,14 @@ async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, pr
 # -----------------------------------------------------------------------------
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
-st.markdown('<div class="main-header">⚡ Adaptive Frontier Web Extractor</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Advanced Priority-Queue Frontier Engine with multi-modal structured extraction.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Data Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Crawl4AI Dynamic Execution + Trafilatura Semantic Article Extraction + JSON-LD Schemas.</div>', unsafe_allow_html=True)
 
-# Engine Status banner
-if CRAWL4AI_AVAILABLE:
-    st.success("✅ **Crawl4AI Dynamic Engine Ready** (Playwright Browser + Dynamic JS Execution)")
+# Engine Status Banner
+if CRAWL4AI_AVAILABLE and TRAFILATURA_AVAILABLE:
+    st.success("✅ **Crawl4AI Dynamic Engine + Trafilatura NLP Ready** (Full Playwright JS + Precision Article Extraction)")
+elif CRAWL4AI_AVAILABLE:
+    st.success("✅ **Crawl4AI Dynamic Engine Ready** (Playwright Browser + DOM Parser)")
 else:
     st.info("⚡ **High-Speed Stealth TLS Engine Ready** (`curl_cffi` Chrome124 Fingerprint).")
 
@@ -442,20 +493,20 @@ if start_btn and target_url:
         with m2:
             st.metric("Reading Time", f"~{page['reading_time_min']} min")
         with m3:
-            st.metric("Data Tables", len(page["tables"]))
+            st.metric("Tables & Key-Values", len(page["tables"]))
         with m4:
-            st.metric("Images Found", len(page["images"]))
+            st.metric("High-Res Images", len(page["images"]))
         with m5:
             st.metric("Discovered Links", len(page["links"]))
 
         st.markdown("---")
 
-        # Organized Feature Tabs
+        # Feature Tabs
         tab_text, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
             "📄 Full Text Content",
-            f"📊 Tables ({len(page['tables'])})",
+            f"📊 Tables & Data ({len(page['tables'])})",
             f"🖼️ Media & Images ({len(page['images'])})",
-            "🏷️ SEO & Metadata",
+            f"🏷️ SEO & JSON-LD ({len(page['metadata'].get('json_ld_schemas', []))})",
             f"📞 Contacts ({len(page['emails'])})",
             f"💻 Code ({len(page['code_snippets'])})",
             "📦 Structured JSON",
@@ -471,30 +522,39 @@ if start_btn and target_url:
                     st.markdown(f"#### {tbl['id']} ({tbl['rows']} rows × {tbl['columns']} cols)")
                     st.dataframe(tbl["dataframe"], use_container_width=True)
             else:
-                st.info("No HTML data tables found on this page.")
+                st.info("No data tables or key-value structures detected.")
 
         with tab_media:
             if page["images"]:
                 cols = st.columns(3)
                 for i, img in enumerate(page["images"][:30]):
                     with cols[i % 3]:
-                        st.image(img["src"], caption=img["alt"][:35], use_container_width=True)
-                        st.caption(f"🔗 [View Source]({img['src']})")
+                        st.image(img["src"], caption=img["alt"][:40], use_container_width=True)
+                        st.caption(f"🔗 [View Original]({img['src']})")
             else:
-                st.info("No images found.")
+                st.info("No high-resolution images found.")
 
         with tab_seo:
             meta = page["metadata"]
             c1, c2 = st.columns(2)
             with c1:
-                st.write("**Title:**", meta.get("title", "N/A"))
-                st.write("**Description:**", meta.get("description", "N/A"))
-                st.write("**Canonical:**", meta.get("canonical", "N/A"))
+                st.write("**Page Title:**", meta.get("title", "N/A"))
+                st.write("**Meta Description:**", meta.get("description", "N/A"))
+                st.write("**Canonical URL:**", meta.get("canonical", "N/A"))
             with c2:
                 st.write("**OpenGraph Title:**", meta.get("og_title", "N/A"))
                 st.write("**OpenGraph Description:**", meta.get("og_description", "N/A"))
                 if meta.get("og_image"):
                     st.image(meta["og_image"], width=300)
+
+            # JSON-LD Schemas Section
+            schemas = meta.get("json_ld_schemas", [])
+            if schemas:
+                st.markdown("### 🧩 Structured JSON-LD Schemas")
+                for s_idx, schema_obj in enumerate(schemas, 1):
+                    s_type = schema_obj.get("@type", "Schema") if isinstance(schema_obj, dict) else "Schema"
+                    with st.expander(f"Schema #{s_idx}: {s_type}", expanded=True):
+                        st.json(schema_obj)
 
         with tab_contacts:
             if page["emails"]:
