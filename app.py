@@ -111,14 +111,21 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
 # MULTI-MODAL CONTENT EXTRACTOR
 # -----------------------------------------------------------------------------
 def extract_editorial_markdown(html_content: str, url: str) -> str:
-    """Extracts complete clean editorial copy, preserving all page sections."""
+    """Extracts complete clean editorial copy, preserving all page sections and formatting card text properly."""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # 1. Remove non-content structural elements
+    # 1. Unpack block-level <a> tags (cards) so headlines and paragraphs don't get wrapped in giant [Title Body](url) brackets
+    for a in soup.find_all("a", href=True):
+        has_blocks = a.find(["h1", "h2", "h3", "h4", "h5", "h6", "div", "p"])
+        txt = a.get_text(" ", strip=True)
+        if has_blocks or (len(txt) > 40 and ("\n" in a.get_text() or len(txt.split()) > 6)):
+            a.unwrap()
+
+    # 2. Remove non-content structural elements
     for el in soup.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
         el.decompose()
 
-    # 2. Remove carousel indicator dots, country modals, and cookie banners
+    # 3. Remove carousel indicator dots, country modals, and cookie banners
     noise_matchers = [
         "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control",
         "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer",
@@ -127,11 +134,11 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
     for el in soup.find_all(lambda e: e.name not in ["html", "body"] and any(m in str(e.get("class", "")).lower() or m in str(e.get("id", "")).lower() for m in noise_matchers)):
         el.decompose()
 
-    # 3. Resolve relative URLs to absolute URLs
+    # 4. Resolve relative URLs to absolute URLs
     for a in soup.find_all("a", href=True):
         a["href"] = urljoin(url, a["href"])
 
-    # 4. Extract Markdown
+    # 5. Extract Markdown
     body = soup.find("body") or soup
     dom_md = markdownify.markdownify(
         str(body),
@@ -140,7 +147,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
         strip=["script", "style", "button", "form", "nav", "svg", "img", "noscript", "iframe"]
     )
 
-    # 5. Clean UI noise phrases
+    # 6. Clean UI noise phrases
     ui_noise = [
         r"Accordion is (?:closed|open)[^\n.]*\.",
         r"Click to (?:expand|collapse)[^\n.]*\.",
@@ -157,7 +164,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
 
     dom_md = re.sub(r"\n{3,}", "\n\n", dom_md).strip()
 
-    # 6. If Trafilatura captures dedicated long-form article body cleanly
+    # 7. Check if Trafilatura captures dedicated single-topic article body cleanly
     if TRAFILATURA_AVAILABLE:
         try:
             traf_md = trafilatura.extract(
