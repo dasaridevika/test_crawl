@@ -4,22 +4,22 @@ import random
 import time
 from urllib.parse import urljoin, urlparse
 import defusedxml.ElementTree as ET
-import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 from markdownify import markdownify as md
 
 # -----------------------------------------------------------------------------
-# PAGE CONFIGURATION & STYLING
+# PAGE CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Enterprise Web Crawler & Data Engine",
+    page_title="Web Data Extractor",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Custom Styling
 st.markdown("""
     <style>
     .main-header {
@@ -32,24 +32,25 @@ st.markdown("""
         font-size: 0.95rem;
         margin-bottom: 1.5rem;
     }
-    .metric-card {
+    .result-container {
         background-color: rgba(128, 128, 128, 0.05);
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 8px;
-        padding: 12px;
+        border: 1px solid rgba(128, 128, 128, 0.15);
+        border-radius: 10px;
+        padding: 20px;
+        margin-top: 15px;
     }
     </style>
 """, unsafe_allow_html=True)
 
 
 # -----------------------------------------------------------------------------
-# CONTENT EXTRACTION & CLEANING UTILITIES
+# EXTRACTION & CLEANING LOGIC
 # -----------------------------------------------------------------------------
 def clean_html_to_markdown(html_content: str, include_links: bool = True) -> str:
-    """Cleans HTML noise and converts main content to clean Markdown."""
+    """Cleans HTML noise and converts the core page content into clean Markdown."""
     soup = BeautifulSoup(html_content, "html.parser")
     
-    # Remove true noise elements
+    # Strip non-content / noise tags
     for el in soup(["script", "style", "noscript", "svg", "iframe"]):
         el.decompose()
 
@@ -57,7 +58,7 @@ def clean_html_to_markdown(html_content: str, include_links: bool = True) -> str
     strip_tags = [] if include_links else ["a"]
     raw_md = md(str(body), heading_style="ATX", strip=strip_tags + ["img"], bullets="-")
     
-    # Clean redundant blank lines
+    # Clean redundant blank lines while preserving paragraphs
     lines = []
     consecutive_empty = 0
     for line in raw_md.splitlines():
@@ -73,18 +74,25 @@ def clean_html_to_markdown(html_content: str, include_links: bool = True) -> str
     return "\n".join(lines).strip()
 
 
-def extract_page_metadata(html_content: str, url: str) -> dict:
-    """Extracts title, description, schema, headings, and internal links."""
+def extract_page_data(html_content: str, url: str) -> dict:
+    """Extracts title, meta description, clean markdown, headings, schema, and links."""
     soup = BeautifulSoup(html_content, "html.parser")
     base_domain = urlparse(url).netloc
     
     title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
     
-    # Description
+    # Meta description
     desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
     description = desc_tag.get("content", "").strip() if desc_tag else ""
     
-    # JSON-LD Schema
+    # Headings
+    headings = [
+        {"level": h.name.upper(), "text": h.get_text(strip=True)}
+        for h in soup.find_all(["h1", "h2", "h3", "h4"])
+        if h.get_text(strip=True)
+    ]
+    
+    # JSON-LD Schemas
     json_ld = []
     for s in soup.find_all("script", type="application/ld+json"):
         try:
@@ -93,9 +101,6 @@ def extract_page_metadata(html_content: str, url: str) -> dict:
         except Exception:
             pass
 
-    # Headings
-    headings = [h.get_text(strip=True) for h in soup.find_all(["h1", "h2", "h3"]) if h.get_text(strip=True)]
-    
     # Internal links
     links = set()
     for a in soup.find_all("a", href=True):
@@ -105,26 +110,65 @@ def extract_page_metadata(html_content: str, url: str) -> dict:
             if urlparse(full_url).netloc == base_domain:
                 links.add(full_url)
 
+    markdown_text = clean_html_to_markdown(html_content)
+
     return {
+        "url": url,
         "title": title,
         "description": description,
+        "markdown": markdown_text,
         "headings": headings,
         "json_ld": json_ld,
-        "links": sorted(list(links))
+        "links": sorted(list(links)),
+        "content_length": len(markdown_text)
     }
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED ASYNC DISCOVERY & CRAWLING ENGINE
+# HIGH-SPEED ASYNC ENGINE (TLS / JA3 IMPERSONATION)
 # -----------------------------------------------------------------------------
+async def fetch_page(session: AsyncSession, url: str, profile: str, timeout: int) -> dict:
+    """Fetches and extracts a page using Chrome TLS impersonation."""
+    try:
+        resp = await session.get(url, impersonate=profile, timeout=timeout)
+        if resp.status_code == 200:
+            data = extract_page_data(resp.text, url)
+            data["status"] = "SUCCESS"
+            data["status_code"] = 200
+            return data
+        else:
+            return {
+                "status": "FAILED",
+                "status_code": resp.status_code,
+                "url": url,
+                "title": f"HTTP {resp.status_code}",
+                "markdown": f"Failed to retrieve content. Server responded with status code {resp.status_code}.",
+                "headings": [],
+                "json_ld": [],
+                "links": [],
+                "content_length": 0
+            }
+    except Exception as e:
+        return {
+            "status": "ERROR",
+            "status_code": 0,
+            "url": url,
+            "title": "Error",
+            "markdown": f"Error fetching URL: {str(e)}",
+            "headings": [],
+            "json_ld": [],
+            "links": [],
+            "content_length": 0
+        }
+
+
 async def discover_sitemap_urls(session: AsyncSession, base_url: str, profile: str) -> list[str]:
-    """Attempts to discover URLs directly from sitemap.xml."""
+    """Attempts to discover URLs directly from sitemap."""
     parsed = urlparse(base_url)
     sitemap_candidates = [
         f"{parsed.scheme}://{parsed.netloc}/sitemap.xml",
         f"{parsed.scheme}://{parsed.netloc}/sitemap_index.xml",
     ]
-
     for s_url in sitemap_candidates:
         try:
             resp = await session.get(s_url, impersonate=profile, timeout=10)
@@ -139,78 +183,17 @@ async def discover_sitemap_urls(session: AsyncSession, base_url: str, profile: s
     return []
 
 
-async def fetch_single_url(session: AsyncSession, url: str, profile: str, timeout: int, delay_range: tuple) -> dict:
-    """Extracts a single page with anti-bot TLS impersonation."""
-    if delay_range[1] > 0:
-        await asyncio.sleep(random.uniform(delay_range[0], delay_range[1]))
-        
-    start_t = time.time()
-    try:
-        resp = await session.get(url, impersonate=profile, timeout=timeout)
-        duration = round(time.time() - start_t, 2)
-        
-        if resp.status_code == 200:
-            meta = extract_page_metadata(resp.text, url)
-            markdown = clean_html_to_markdown(resp.text)
-            return {
-                "status": "SUCCESS",
-                "status_code": 200,
-                "url": url,
-                "title": meta["title"],
-                "description": meta["description"],
-                "headings_count": len(meta["headings"]),
-                "discovered_links_count": len(meta["links"]),
-                "markdown": markdown,
-                "headings": meta["headings"],
-                "json_ld": meta["json_ld"],
-                "links": meta["links"],
-                "response_time_sec": duration,
-                "content_length": len(markdown)
-            }
-        else:
-            return {
-                "status": "FAILED",
-                "status_code": resp.status_code,
-                "url": url,
-                "title": f"HTTP {resp.status_code}",
-                "description": "",
-                "markdown": "",
-                "response_time_sec": duration,
-                "error": f"HTTP {resp.status_code}"
-            }
-    except Exception as e:
-        return {
-            "status": "ERROR",
-            "status_code": 0,
-            "url": url,
-            "title": "Error",
-            "description": "",
-            "markdown": "",
-            "response_time_sec": round(time.time() - start_t, 2),
-            "error": str(e)
-        }
-
-
-async def run_hub_and_spoke_crawler(
+async def crawl_domain(
     seed_url: str,
     max_pages: int,
     concurrency: int,
     profile: str,
     timeout: int,
-    delay_range: tuple,
-    url_pattern: str,
     progress_bar,
     status_text
 ) -> list[dict]:
-    """
-    Production-Grade Hub-and-Spoke Crawling Pipeline:
-    1. Instant Sitemap Discovery (Hub)
-    2. Fallback to BFS recursive discovery if sitemap not found
-    3. URL queue filtering, deduplication & randomization
-    4. Async TLS worker pool (Spokes) with adaptive concurrency
-    """
+    """Crawls multiple pages from domain using Hub-and-Spoke and returns extracted results."""
     semaphore = asyncio.Semaphore(concurrency)
-    discovered_urls = []
     
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -222,231 +205,198 @@ async def run_hub_and_spoke_crawler(
     }
 
     async with AsyncSession(headers=headers) as session:
-        # STEP 1: Discovery (Hub)
-        status_text.text("🔍 Phase 1: Checking sitemap.xml for instant index discovery...")
+        status_text.text("🔍 Phase 1: Checking sitemap.xml for fast URL discovery...")
         sitemap_urls = await discover_sitemap_urls(session, seed_url, profile)
         
         if sitemap_urls:
-            status_text.text(f"✅ Found {len(sitemap_urls):,} URLs in sitemap index.")
-            discovered_urls = sitemap_urls
+            status_text.text(f"✅ Found {len(sitemap_urls):,} URLs in sitemap.")
+            targets = sitemap_urls
         else:
-            status_text.text("⚠️ No sitemap found. Performing fast seed link extraction...")
-            seed_res = await fetch_single_url(session, seed_url, profile, timeout, (0, 0))
-            if seed_res.get("status") == "SUCCESS":
-                discovered_urls = [seed_url] + seed_res.get("links", [])
+            status_text.text("⚠️ No sitemap found. Extracting links from seed page...")
+            seed_data = await fetch_page(session, seed_url, profile, timeout)
+            targets = [seed_url] + seed_data.get("links", [])
 
-        # STEP 2: Filter and Randomize Queue
-        if url_pattern:
-            discovered_urls = [u for u in discovered_urls if url_pattern.lower() in u.lower()]
-            
-        discovered_urls = list(dict.fromkeys(discovered_urls))  # Deduplicate
-        random.shuffle(discovered_urls)  # Randomize to avoid linear scraping signatures
+        # Deduplicate & Shuffle
+        targets = list(dict.fromkeys(targets))
+        random.shuffle(targets)
+        batch = targets[:max_pages]
+
+        if not batch and seed_url not in batch:
+            batch = [seed_url]
+
+        status_text.text(f"🚀 Phase 2: Extracting data from {len(batch)} pages in parallel...")
         
-        target_batch = discovered_urls[:max_pages]
-        if not target_batch and seed_url not in target_batch:
-            target_batch = [seed_url]
-
-        total_targets = len(target_batch)
-        status_text.text(f"🚀 Phase 2: Extracting {total_targets} pages across {concurrency} async TLS workers...")
-
-        # STEP 3: High-Speed Async Spokes Extraction
         results = []
         completed = 0
 
-        async def worker(url: str):
+        async def worker(u: str):
             nonlocal completed
             async with semaphore:
-                res = await fetch_single_url(session, url, profile, timeout, delay_range)
-                results.append(res)
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+                data = await fetch_page(session, u, profile, timeout)
+                results.append(data)
                 completed += 1
-                progress_bar.progress(completed / total_targets)
-                status_text.text(f"⚡ Extracted {completed}/{total_targets} pages | Current: {url[:50]}...")
+                progress_bar.progress(completed / len(batch))
 
-        tasks = [worker(url) for url in target_batch]
+        tasks = [worker(u) for u in batch]
         await asyncio.gather(*tasks)
 
-        status_text.text(f"✅ Extraction completed for {len(results)} pages.")
+        status_text.text(f"✅ Extracted data from {len(results)} pages.")
         return results
 
 
 # -----------------------------------------------------------------------------
-# SIDEBAR: PRODUCTION CONFIGURATION
+# SIDEBAR SETTINGS
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.title("⚙️ Engine Controls")
+    st.title("⚙️ Crawl Settings")
     
     crawl_mode = st.radio(
-        "Crawl Mode",
-        ["Single Page Extraction", "Multi-Page Domain Crawl"],
-        index=1,
-        help="Single Page: Fast instant extraction. Multi-Page: Crawls domain using Hub-and-Spoke."
+        "Mode",
+        ["Single URL", "Domain Crawl (Multi-Page)"],
+        index=0
     )
     
-    st.markdown("---")
-    st.subheader("🛡️ Anti-Bot Parameters")
-    
-    impersonate_choice = st.selectbox(
-        "TLS / Browser Fingerprint",
+    tls_profile = st.selectbox(
+        "TLS Browser Profile",
         ["chrome120", "chrome119", "safari17_0", "edge101"],
         index=0,
-        help="Impersonates exact TLS handshakes, JA3/JA4 signatures, and HTTP/2 frames."
+        help="Impersonates exact TLS handshakes and JA3/JA4 fingerprints to bypass bot blocks."
     )
     
-    min_delay = st.number_input("Min Delay (s)", min_value=0.0, max_value=5.0, value=0.1, step=0.1)
-    max_delay = st.number_input("Max Delay (s)", min_value=0.0, max_value=5.0, value=0.4, step=0.1)
-    
-    if crawl_mode == "Multi-Page Domain Crawl":
-        st.markdown("---")
-        st.subheader("⚡ Concurrency & Bounds")
-        max_pages_input = st.slider("Max Pages to Extract", min_value=5, max_value=200, value=25, step=5)
-        concurrency_input = st.slider("Concurrent Workers", min_value=1, max_value=20, value=8, step=1)
-        url_filter_keyword = st.text_input("URL Keyword Filter (Optional)", placeholder="e.g. /product/ or /news/")
+    if crawl_mode == "Domain Crawl (Multi-Page)":
+        max_pages = st.slider("Pages to Extract", min_value=2, max_value=50, value=10, step=1)
+        concurrency = st.slider("Workers (Concurrency)", min_value=1, max_value=15, value=5, step=1)
     else:
-        max_pages_input = 1
-        concurrency_input = 1
-        url_filter_keyword = ""
+        max_pages = 1
+        concurrency = 1
 
-    request_timeout = st.slider("Request Timeout (s)", 5, 45, 15)
-    include_hyperlinks = st.checkbox("Preserve Links in Markdown", value=True)
+    request_timeout = st.slider("Timeout (seconds)", 5, 45, 15)
 
 
 # -----------------------------------------------------------------------------
-# MAIN DASHBOARD INTERFACE
+# MAIN UI & DATA DISPLAY
 # -----------------------------------------------------------------------------
-st.markdown('<div class="main-header">⚡ Production Web Crawler & Data Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">High-throughput, anti-bot resistant extraction engine with automated sitemap discovery & TLS impersonation.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚡ Web Data Extractor</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Enter any URL below to bypass bot detection and immediately view the extracted data.</div>', unsafe_allow_html=True)
 
-# Input Row
-col_url, col_btn = st.columns([5, 1])
-with col_url:
-    input_url = st.text_input(
+# Input Bar
+col1, col2 = st.columns([5, 1])
+with col1:
+    target_url = st.text_input(
         "Target URL",
         value="https://www.nvidia.com/en-in/",
         placeholder="https://example.com",
         label_visibility="collapsed"
     )
-with col_btn:
-    start_crawl = st.button("🚀 Start Engine", type="primary", use_container_width=True)
+with col2:
+    start_btn = st.button("🚀 Extract Data", type="primary", use_container_width=True)
 
-# Crawl Execution
-if start_crawl and input_url:
-    if not input_url.startswith(("http://", "https://")):
-        input_url = "https://" + input_url
+if start_btn and target_url:
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
-    
     start_time = time.time()
 
-    if crawl_mode == "Single Page Extraction":
-        status_text.text(f"Connecting to {input_url} via {impersonate_choice} TLS session...")
+    if crawl_mode == "Single URL":
+        status_text.text(f"Extracting {target_url} via {tls_profile} TLS session...")
         async def run_single():
             async with AsyncSession() as s:
-                return await fetch_single_url(s, input_url, impersonate_choice, request_timeout, (0, 0))
-        results = [asyncio.run(run_single())]
+                return await fetch_page(s, target_url, tls_profile, request_timeout)
+        extracted_results = [asyncio.run(run_single())]
         progress_bar.progress(1.0)
-        status_text.text("✅ Single page extraction complete.")
+        status_text.text("✅ Extraction complete.")
     else:
-        results = asyncio.run(
-            run_hub_and_spoke_crawler(
-                seed_url=input_url,
-                max_pages=max_pages_input,
-                concurrency=concurrency_input,
-                profile=impersonate_choice,
+        extracted_results = asyncio.run(
+            crawl_domain(
+                seed_url=target_url,
+                max_pages=max_pages,
+                concurrency=concurrency,
+                profile=tls_profile,
                 timeout=request_timeout,
-                delay_range=(min_delay, max_delay),
-                url_pattern=url_filter_keyword,
                 progress_bar=progress_bar,
                 status_text=status_text
             )
         )
 
     elapsed_time = round(time.time() - start_time, 2)
-    successful_results = [r for r in results if r.get("status") == "SUCCESS"]
+    successful = [r for r in extracted_results if r.get("status") == "SUCCESS"]
 
-    # Metric Row
     st.markdown("---")
-    m1, m2, m3, m4, m5 = st.columns(5)
+
+    # Metrics Summary
+    m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Total Pages Crawled", len(results))
+        st.metric("Pages Extracted", len(extracted_results))
     with m2:
-        st.metric("Successful (200 OK)", len(successful_results))
+        st.metric("Total Extracted Chars", f"{sum(r.get('content_length', 0) for r in successful):,}")
     with m3:
-        st.metric("Total Execution Time", f"{elapsed_time}s")
+        st.metric("Execution Time", f"{elapsed_time}s")
     with m4:
-        avg_speed = round(len(results) / elapsed_time, 2) if elapsed_time > 0 else 0
-        st.metric("Throughput", f"{avg_speed} pages/s")
-    with m5:
-        total_chars = sum(r.get("content_length", 0) for r in successful_results)
-        st.metric("Extracted Volume", f"{total_chars:,} chars")
+        st.metric("Status", "✅ 200 OK" if successful else "❌ Failed")
 
-    # Display Results
     st.markdown("---")
-    
-    # Export Options Top Bar
-    exp_col1, exp_col2, _ = st.columns([1.5, 1.5, 4])
-    with exp_col1:
-        json_export = json.dumps(results, indent=2, ensure_ascii=False)
-        st.download_button(
-            label="📥 Download Dataset (JSON)",
-            data=json_export,
-            file_name=f"crawled_dataset_{int(time.time())}.json",
-            mime="application/json",
-            use_container_width=True
-        )
-    with exp_col2:
-        df_summary = pd.DataFrame([
-            {
-                "Status": r.get("status_code"),
-                "URL": r.get("url"),
-                "Title": r.get("title"),
-                "Content Length": r.get("content_length", 0),
-                "Response Time (s)": r.get("response_time_sec", 0)
-            }
-            for r in results
+
+    # =========================================================================
+    # DIRECT EXTRACTED DATA DISPLAY (NO DOWNLOAD BUTTONS)
+    # =========================================================================
+    st.subheader("📄 Extracted Data Output")
+
+    if crawl_mode == "Single URL" and successful:
+        page = successful[0]
+        
+        st.markdown(f"### {page.get('title', 'Untitled')}")
+        if page.get("description"):
+            st.caption(f"**Description:** {page['description']}")
+        
+        tab_md, tab_json, tab_structure, tab_links = st.tabs([
+            "📝 Extracted Markdown Content",
+            "📊 Structured JSON Data",
+            "📑 Headings & Hierarchy",
+            "🔗 Extracted Links"
         ])
-        csv_export = df_summary.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Summary (CSV)",
-            data=csv_export,
-            file_name=f"crawl_summary_{int(time.time())}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
 
-    # Result Tabs
-    tab_overview, tab_viewer, tab_json = st.tabs([
-        "📋 Dataset Overview",
-        "📖 Page-by-Page Inspector",
-        "📊 Raw JSON Output"
-    ])
+        with tab_md:
+            st.markdown(page["markdown"])
 
-    with tab_overview:
-        st.dataframe(df_summary, use_container_width=True, height=400)
+        with tab_json:
+            st.json(page)
 
-    with tab_viewer:
-        if successful_results:
-            selected_url = st.selectbox(
-                "Select a crawled page to inspect:",
-                [r["url"] for r in successful_results]
-            )
-            selected_page = next((r for r in successful_results if r["url"] == selected_url), None)
-            
-            if selected_page:
-                st.subheader(selected_page.get("title", "Untitled"))
-                st.caption(f"🔗 URL: {selected_page['url']} | ⏱️ Fetch time: {selected_page['response_time_sec']}s")
+        with tab_structure:
+            if page.get("headings"):
+                for h in page["headings"]:
+                    st.markdown(f"- **{h['level']}**: {h['text']}")
+            else:
+                st.info("No headings found.")
+
+        with tab_links:
+            if page.get("links"):
+                st.write(f"Found **{len(page['links'])}** internal URLs:")
+                for link in page["links"]:
+                    st.markdown(f"- [{link}]({link})")
+            else:
+                st.info("No links found.")
+
+    elif crawl_mode == "Domain Crawl (Multi-Page)" and successful:
+        st.write(f"Displaying extracted data for **{len(successful)}** pages:")
+
+        for idx, page in enumerate(successful, start=1):
+            with st.expander(f"**{idx}. {page.get('title', 'Untitled')}** — `{page.get('url')}`", expanded=(idx == 1)):
+                st.caption(f"🔗 **URL:** {page.get('url')} | 📏 **Length:** {page.get('content_length', 0):,} chars")
                 
-                md_tab, schema_tab, links_tab = st.tabs(["📝 Markdown", "📑 Schema / Metadata", "🔗 Outlinks"])
-                with md_tab:
-                    st.markdown(selected_page.get("markdown", "No content extracted."))
-                with schema_tab:
-                    st.write("**Headings:**", selected_page.get("headings", []))
-                    st.write("**JSON-LD Structured Schema:**", selected_page.get("json_ld", []))
-                with links_tab:
-                    st.write(f"**Discovered {len(selected_page.get('links', []))} outlinks:**")
-                    st.dataframe(selected_page.get("links", []), column_config={"value": "URL"}, use_container_width=True)
-        else:
-            st.warning("No successful pages to display.")
-
-    with tab_json:
-        st.json(results)
+                tab_p_md, tab_p_json, tab_p_links = st.tabs(["📝 Extracted Markdown", "📊 JSON", "🔗 Outlinks"])
+                
+                with tab_p_md:
+                    st.markdown(page.get("markdown", "No content."))
+                
+                with tab_p_json:
+                    st.json(page)
+                    
+                with tab_p_links:
+                    st.write(f"**{len(page.get('links', []))} outlinks:**")
+                    for l in page.get("links", [])[:30]:
+                        st.markdown(f"- [{l}]({l})")
+    else:
+        st.error("No content could be extracted. Please check the URL or try another TLS profile in the sidebar.")
