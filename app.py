@@ -65,6 +65,7 @@ st.markdown("""
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
+    .page-banner { background: #f1f5f9; border-left: 4px solid #2563eb; padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -85,7 +86,7 @@ class FrontierItem:
 
 def calculate_url_priority(url: str, depth: int) -> float:
     """Heuristic scoring: prioritizes content paths and penalizes depth."""
-    score = 100.0 - (depth * 20.0)
+    score = 100.0 - (depth * 15.0)
     valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/", "/case-studies/", "/solutions/"]
     if any(k in url.lower() for k in valuable_keywords):
         score += 35.0
@@ -114,7 +115,6 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     target_netloc = parsed.netloc.lower()
     
     if (target_netloc == base_domain or target_netloc.endswith("." + root_base) or target_netloc == root_base) and parsed.scheme in ("http", "https"):
-        # Ignore binary or media file extensions
         if not full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe")):
             return full_url
     return None
@@ -365,6 +365,7 @@ async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, pro
                     page_data = extract_multimodal_data(res.html or "", item.url, base_domain)
                     page_data["status"] = "SUCCESS"
                     page_data["fetch_time_sec"] = duration
+                    page_data["depth"] = item.depth
                     results.append(page_data)
 
                     if item.depth < max_depth:
@@ -377,12 +378,12 @@ async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, pro
                 pass
 
             if progress_bar:
-                progress_bar.progress(len(results) / max_pages)
+                progress_bar.progress(min(1.0, len(results) / max_pages))
 
     return results
 
 
-async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text, concurrency: int = 5) -> list[dict]:
+async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text, concurrency: int = 6) -> list[dict]:
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
 
@@ -405,7 +406,7 @@ async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_dep
                 batch.append(heapq.heappop(frontier))
 
             if status_text:
-                status_text.text(f"🚀 [Fast Engine Batch] Crawling {len(results)}/{max_pages} pages ({len(frontier)} queued in frontier)...")
+                status_text.text(f"🚀 [Fast Engine Batch] Crawled {len(results)}/{max_pages} pages ({len(frontier)} queued in frontier)...")
 
             async def fetch_item(item):
                 t0 = time.time()
@@ -416,6 +417,7 @@ async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_dep
                         data = extract_multimodal_data(resp.text, item.url, base_domain)
                         data["status"] = "SUCCESS"
                         data["fetch_time_sec"] = dur
+                        data["depth"] = item.depth
                         return data, item.depth
                 except Exception:
                     pass
@@ -453,7 +455,7 @@ elif CRAWL4AI_AVAILABLE:
 else:
     st.info("⚡ **High-Speed Stealth TLS Engine Ready** (`curl_cffi` Chrome124 Fingerprint).")
 
-col1, col2, col3 = st.columns([5, 3, 2])
+col1, col2, col3, col4 = st.columns([4, 2, 2, 2])
 with col1:
     target_url = st.text_input(
         "Target URL",
@@ -463,14 +465,22 @@ with col1:
     )
 with col2:
     crawl_limit = st.selectbox(
-        "Crawl Depth / Scope",
+        "Pages to Crawl",
         options=[1, 5, 15, 50, 100, 250],
         index=2,
-        format_func=lambda x: f"📑 Crawl {x} Pages{' (Full Section)' if x == 15 else ' (Deep Site)' if x >= 50 else ''}",
+        format_func=lambda x: f"📑 Crawl {x} Pages{' (Section)' if x == 15 else ' (Deep)' if x >= 50 else ''}",
         label_visibility="collapsed"
     )
 with col3:
-    start_btn = st.button("🚀 Start Full Crawl", type="primary", use_container_width=True)
+    crawl_depth = st.selectbox(
+        "Crawl Depth",
+        options=[1, 2, 3, 5],
+        index=2,
+        format_func=lambda d: f"🌲 Depth {d} ({'Seed Only' if d == 1 else 'Direct Links' if d == 2 else 'Deep Recursive'})",
+        label_visibility="collapsed"
+    )
+with col4:
+    start_btn = st.button("🚀 Start Crawl", type="primary", use_container_width=True)
 
 if start_btn and target_url:
     if not target_url.startswith(("http://", "https://")):
@@ -483,14 +493,13 @@ if start_btn and target_url:
     start_total_t = time.time()
     crawled_data = []
 
-    # Use Crawl4AI for targeted crawls (<= 15 pages) and high-concurrency engine for massive deep crawls
     if CRAWL4AI_AVAILABLE and crawl_limit <= 15:
         try:
             crawled_data = asyncio.run(
                 crawl_with_crawl4ai(
                     seed_url=target_url,
                     max_pages=crawl_limit,
-                    max_depth=5,
+                    max_depth=crawl_depth,
                     progress_bar=progress,
                     status_text=status
                 )
@@ -501,7 +510,7 @@ if start_btn and target_url:
                 crawl_with_curl_cffi_concurrent(
                     seed_url=target_url,
                     max_pages=crawl_limit,
-                    max_depth=5,
+                    max_depth=crawl_depth,
                     progress_bar=progress,
                     status_text=status,
                     concurrency=5
@@ -512,7 +521,7 @@ if start_btn and target_url:
             crawl_with_curl_cffi_concurrent(
                 seed_url=target_url,
                 max_pages=crawl_limit,
-                max_depth=5,
+                max_depth=crawl_depth,
                 progress_bar=progress,
                 status_text=status,
                 concurrency=6
@@ -549,14 +558,32 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
 
     st.markdown("---")
 
+    # Interactive Table of All Crawled Pages
+    st.markdown("### 📋 Crawled Pages Index")
+    summary_df = pd.DataFrame([
+        {
+            "Page #": i + 1,
+            "Title": p["title"][:60],
+            "Words": p["word_count"],
+            "Images": len(p["images"]),
+            "Tables": len(p["tables"]),
+            "Depth": p.get("depth", 0),
+            "URL": p["url"]
+        }
+        for i, p in enumerate(crawled_data)
+    ])
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
     # Export & Search Bar
     exp_col1, exp_col2 = st.columns([4, 1])
     with exp_col1:
-        search_query = st.text_input("🔍 Search within all crawled pages:", placeholder="Filter by keyword (e.g. quantum, blackwell, pricing)...", label_visibility="collapsed")
+        search_query = st.text_input("🔍 Search across all crawled pages:", placeholder="Filter by keyword (e.g. quantum, blackwell, pricing, safety)...", label_visibility="collapsed")
     with exp_col2:
         export_payload = json.dumps([{k: v for k, v in p.items() if k != "tables"} for p in crawled_data], indent=2)
         st.download_button(
-            "📦 Export Full Dataset (JSON)",
+            "📦 Export Dataset (JSON)",
             data=export_payload,
             file_name="full_site_crawl_dataset.json",
             mime="application/json",
@@ -571,22 +598,21 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
         filtered_pages = crawled_data
 
     # Page Selection Bar
-    page_titles = [f"Page {i+1}: {p['title'][:45]} ({p['word_count']} words)" for i, p in enumerate(filtered_pages)]
+    page_titles = [f"Page {i+1}: {p['title'][:55]} ({p['word_count']} words)" for i, p in enumerate(filtered_pages)]
     selected_idx = 0
     if len(filtered_pages) > 1:
-        selected_label = st.selectbox("📂 **Select Page to Inspect:**", options=page_titles, index=0)
+        selected_label = st.selectbox("📂 **Select Page to Read / Inspect:**", options=page_titles, index=0)
         selected_idx = page_titles.index(selected_label)
 
     if filtered_pages:
         page = filtered_pages[selected_idx]
 
-        st.markdown(f"### {page['title']}")
-        st.caption(f"🔗 URL: [{page['url']}]({page['url']}) | ⏱️ Fetched in {page.get('fetch_time_sec', 0)}s | 📝 Words: {page['word_count']:,}")
+        st.markdown(f'<div class="page-banner"><b>Currently Reading:</b> {page["title"]}<br><small>🔗 <a href="{page["url"]}" target="_blank">{page["url"]}</a> | ⏱️ Fetched in {page.get("fetch_time_sec", 0)}s | 📝 {page["word_count"]:,} words</small></div>', unsafe_allow_html=True)
 
         # Multi-Modal Tabs
         tab_text, tab_all, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
-            "📄 Page Text Content",
-            f"📚 All {len(crawled_data)} Pages Combined",
+            f"📄 Read Page #{selected_idx+1} Content",
+            f"📚 All {len(crawled_data)} Pages Full Text",
             f"📊 Tables & Data ({len(page['tables'])})",
             f"🖼️ Media & Images ({len(page['images'])})",
             f"🏷️ SEO & JSON-LD ({len(page['metadata'].get('json_ld_schemas', []))})",
@@ -600,11 +626,11 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
             st.markdown(page["markdown"])
 
         with tab_all:
-            st.markdown(f"## 📚 Consolidated Content from All {len(crawled_data)} Crawled Pages")
+            st.markdown(f"## 📚 Consolidated Full-Text of All {len(crawled_data)} Crawled Pages")
             for p_i, p_obj in enumerate(crawled_data, 1):
-                with st.expander(f"📖 Page {p_i}: {p_obj['title']} ({p_obj['word_count']} words)", expanded=(p_i == 1)):
-                    st.caption(f"Source: [{p_obj['url']}]({p_obj['url']})")
-                    st.markdown(p_obj["markdown"])
+                st.markdown(f"--- \n### 📖 Page {p_i}: {p_obj['title']}")
+                st.caption(f"🔗 Source: [{p_obj['url']}]({p_obj['url']}) | 📝 {p_obj['word_count']} words")
+                st.markdown(p_obj["markdown"])
 
         with tab_tables:
             if page["tables"]:
