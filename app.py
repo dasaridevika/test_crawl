@@ -95,28 +95,120 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     return None
 
 
-def sanitize_markdown_content(text: str) -> str:
-    """Removes UI icon artifacts, menu tokens, and mega-footer country dumps."""
-    if not text:
-        return ""
-    ui_noise_patterns = [
-        r"(?:Menu\s+icon|Close\s+icon|Caret\s+(?:down|up|right|left)\s+icon|Accordion is (?:closed|open)[^.\n]*\.)+",
-        r"Click to (?:expand|collapse)[^\n.]*\.",
-        r"Shopping Cart Click to see cart items",
-        r"Search icon Click to search",
-        r"<util:I18n[^>]*>",
-        r"\b(?:Previous|Next)\s+Short Description\b",
-        r"Short Description(?:\n[A-Za-z0-9\s_-]+)+",
-    ]
-    cleaned = text
-    for pat in ui_noise_patterns:
-        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+def extract_exact_structured_markdown(soup_root: BeautifulSoup, base_url: str) -> str:
+    """Compiles exact, hierarchical, clean Markdown from the DOM tree."""
+    s = BeautifulSoup(str(soup_root), "html.parser")
 
-    # Clean country selector dump at the end
-    cleaned = re.sub(r"Select Location\s+The Americas[\s\S]*?(?=(\n\n|\Z))", "", cleaned, flags=re.IGNORECASE)
-    # Clean excessive blank lines
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
+    # 1. Decompose noisy script/style/nav/header/footer tags
+    for el in s.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
+        el.decompose()
+
+    # 2. Decompose noisy UI component classes & IDs
+    noise_matchers = [
+        "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control", 
+        "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer", 
+        "country-selector", "location-selector", "sr-only", "region-selector"
+    ]
+    
+    for el in s.find_all(lambda e: e.name not in ["html", "body"] and any(m in str(e.get("class", "")).lower() or m in str(e.get("id", "")).lower() for m in noise_matchers)):
+        el.decompose()
+
+    output = []
+    seen = set()
+
+    def is_duplicate(txt_key: str) -> bool:
+        if not txt_key or len(txt_key) < 5:
+            return False
+        if txt_key in seen:
+            return True
+        for h in seen:
+            if len(h) >= 10 and (txt_key in h or h in txt_key):
+                return True
+        return False
+
+    def walk(node):
+        if not node or not hasattr(node, "name") or node.name is None:
+            return
+
+        tag_name = node.name.lower()
+
+        # Headings (H1 - H6)
+        if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+            try:
+                level = int(tag_name[1])
+            except ValueError:
+                level = 2
+            spans = [s.get_text(" ", strip=True) for s in node.find_all("span") if s.get_text(strip=True)]
+            if len(spans) >= 2 and len(spans[0].split()) <= 3:
+                eyebrow = spans[0]
+                headline = " ".join(spans[1:])
+                clean_h = f"[{eyebrow}] {headline}"
+            else:
+                clean_h = node.get_text(" ", strip=True)
+            clean_h = re.sub(r"\s+", " ", clean_h).strip()
+            
+            clean_key = re.sub(r"\W+", "", clean_h).lower()
+            if clean_h and not is_duplicate(clean_key):
+                seen.add(clean_key)
+                output.append(f"\n\n" + "#" * level + f" {clean_h}\n")
+            return
+
+        # Paragraphs / Descriptions
+        if tag_name == "p":
+            for a in node.find_all("a", href=True):
+                a_href = urljoin(base_url, a["href"])
+                a_txt = a.get_text(" ", strip=True)
+                if a_txt:
+                    a.replace_with(f" [{a_txt}]({a_href}) ")
+            txt = node.get_text(" ", strip=True)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            clean_key = re.sub(r"\W+", "", txt).lower()
+            if txt and len(txt) > 3 and not is_duplicate(clean_key):
+                seen.add(clean_key)
+                output.append(f"\n{txt}\n")
+            return
+
+        # Lists (ul, ol)
+        if tag_name in ["ul", "ol"]:
+            list_items = []
+            for li in node.find_all("li", recursive=False):
+                for a in li.find_all("a", href=True):
+                    a_href = urljoin(base_url, a["href"])
+                    a_txt = a.get_text(" ", strip=True)
+                    if a_txt:
+                        a.replace_with(f" [{a_txt}]({a_href}) ")
+                li_txt = li.get_text(" ", strip=True)
+                li_txt = re.sub(r"\s+", " ", li_txt).strip()
+                clean_key = re.sub(r"\W+", "", li_txt).lower()
+                if li_txt and len(li_txt) > 2 and not is_duplicate(clean_key):
+                    seen.add(clean_key)
+                    list_items.append(f"- {li_txt}")
+            if list_items and not (len(list_items) > 3 and all(len(item.split()) <= 2 for item in list_items)):
+                output.append("\n" + "\n".join(list_items) + "\n")
+            return
+
+        # Standalone Action Links / Cards
+        if tag_name == "a" and node.get("href") and not node.find_parent(["p", "li", "h1", "h2", "h3", "h4", "h5", "h6"]):
+            href = urljoin(base_url, node["href"])
+            txt = node.get_text(" ", strip=True)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            clean_key = re.sub(r"\W+", "", txt).lower()
+            if txt and len(txt) > 1 and not txt.lower().startswith(("menu", "close", "http", "prev", "next", "short desc")):
+                if not is_duplicate(clean_key):
+                    seen.add(clean_key)
+                    output.append(f"👉 [{txt}]({href})\n")
+            return
+
+        # Recurse for containers (div, section, article, main)
+        for child in node.children:
+            if hasattr(child, "name") and child.name:
+                walk(child)
+
+    walk(s.body or s)
+
+    full_md = "".join(output)
+    full_md = re.sub(r"\n{3,}", "\n\n", full_md).strip()
+    return full_md
 
 
 # -----------------------------------------------------------------------------
@@ -126,15 +218,8 @@ def extract_multimodal_data(html_content: str, raw_markdown: str | None, url: st
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
 
-    # 1. Clean Markdown Content
-    if raw_markdown and len(raw_markdown.strip()) > 50:
-        markdown_content = sanitize_markdown_content(raw_markdown)
-    else:
-        for el in soup(["script", "style", "noscript", "svg", "iframe"]):
-            el.decompose()
-        body = soup.find("body") or soup
-        raw_md = markdownify.markdownify(str(body), heading_style="ATX", strip=['script', 'style'])
-        markdown_content = sanitize_markdown_content(raw_md)
+    # 1. Exact Hierarchical Markdown Content
+    markdown_content = extract_exact_structured_markdown(soup, url)
 
     # 2. Extract HTML Data Tables into DataFrames
     extracted_tables = []
