@@ -107,35 +107,15 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     return None
 
 
-# -----------------------------------------------------------------------------
-# MULTI-MODAL CONTENT EXTRACTOR (TRAFILATURA + DOM HYBRID)
-# -----------------------------------------------------------------------------
 def extract_editorial_markdown(html_content: str, url: str) -> str:
-    """Extracts clean editorial copy using Trafilatura with DOM fallback."""
-    # 1. Try Trafilatura for clean article/text extraction
-    if TRAFILATURA_AVAILABLE:
-        try:
-            traf_md = trafilatura.extract(
-                html_content,
-                url=url,
-                output_format="markdown",
-                include_links=True,
-                include_images=False,
-                include_tables=True,
-                favor_precision=True
-            )
-            if traf_md and len(traf_md.strip()) > 120:
-                return traf_md.strip()
-        except Exception:
-            pass
-
-    # 2. Hybrid DOM Markdown Extraction
+    """Extracts complete clean editorial copy, preserving all page sections."""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Remove non-content structural elements
+    # 1. Remove non-content structural elements
     for el in soup.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
         el.decompose()
 
+    # 2. Remove carousel indicator dots, country modals, and cookie banners
     noise_matchers = [
         "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control",
         "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer",
@@ -144,17 +124,20 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
     for el in soup.find_all(lambda e: e.name not in ["html", "body"] and any(m in str(e.get("class", "")).lower() or m in str(e.get("id", "")).lower() for m in noise_matchers)):
         el.decompose()
 
+    # 3. Resolve relative URLs to absolute URLs
     for a in soup.find_all("a", href=True):
         a["href"] = urljoin(url, a["href"])
 
+    # 4. Extract Markdown
     body = soup.find("body") or soup
-    md = markdownify.markdownify(
+    dom_md = markdownify.markdownify(
         str(body),
         heading_style="ATX",
         bullets="-",
         strip=["script", "style", "button", "form", "nav", "svg", "img", "noscript", "iframe"]
     )
 
+    # 5. Clean UI noise phrases
     ui_noise = [
         r"Accordion is (?:closed|open)[^\n.]*\.",
         r"Click to (?:expand|collapse)[^\n.]*\.",
@@ -167,9 +150,29 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
         r"Select Location\s+The Americas[\s\S]*?(?=(\n\n|\Z))"
     ]
     for pat in ui_noise:
-        md = re.sub(pat, "", md, flags=re.IGNORECASE)
+        dom_md = re.sub(pat, "", dom_md, flags=re.IGNORECASE)
 
-    return re.sub(r"\n{3,}", "\n\n", md).strip()
+    dom_md = re.sub(r"\n{3,}", "\n\n", dom_md).strip()
+
+    # 6. If Trafilatura is available and matches full content scope, we can compare
+    if TRAFILATURA_AVAILABLE:
+        try:
+            traf_md = trafilatura.extract(
+                html_content,
+                url=url,
+                output_format="markdown",
+                include_links=True,
+                include_images=False,
+                include_tables=True,
+                favor_precision=True
+            )
+            # Use Trafilatura only if it captures most of the page text (single long-form article)
+            if traf_md and len(traf_md.strip()) > 0.7 * len(dom_md):
+                return traf_md.strip()
+        except Exception:
+            pass
+
+    return dom_md
 
 
 def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> dict:
