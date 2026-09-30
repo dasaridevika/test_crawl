@@ -1,20 +1,36 @@
 import asyncio
 import heapq
 import json
+import os
 import re
+import sys
 import time
 from urllib.parse import urljoin, urlparse
+
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-from pydantic import BaseModel, Field
+import markdownify
+
+# Safe imports for Crawl4AI and curl_cffi with zero-crash guarantee
+try:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    CRAWL4AI_AVAILABLE = False
+
+try:
+    from curl_cffi.requests import AsyncSession as CffiAsyncSession
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Adaptive Frontier Web Engine (Crawl4AI)",
+    page_title="Adaptive Frontier Web Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -23,8 +39,9 @@ st.set_page_config(
 st.markdown("""
     <style>
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
-    .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.5rem; }
+    .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
+    .status-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 0.85rem; font-weight: 600; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -68,22 +85,22 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
 
 
 # -----------------------------------------------------------------------------
-# MULTI-MODAL EXTRACTOR FOR CRAWL4AI RESULT
+# MULTI-MODAL CONTENT EXTRACTOR
 # -----------------------------------------------------------------------------
-def process_crawl4ai_result(result, url: str, base_domain: str) -> dict:
-    html_content = result.html or ""
+def extract_multimodal_data(html_content: str, raw_markdown: str | None, url: str, base_domain: str) -> dict:
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
 
-    # 1. Clean Markdown Content (from Crawl4AI's native extraction)
-    markdown_content = result.markdown or ""
-    if not markdown_content:
+    # 1. Clean Markdown Content
+    if raw_markdown and len(raw_markdown.strip()) > 50:
+        markdown_content = raw_markdown
+    else:
         for el in soup(["script", "style", "noscript", "svg", "iframe"]):
             el.decompose()
         body = soup.find("body") or soup
-        markdown_content = body.get_text("\n\n", strip=True)
+        markdown_content = markdownify.markdownify(str(body), heading_style="ATX", strip=['script', 'style'])
 
-    # 2. Extract HTML Data Tables
+    # 2. Extract HTML Data Tables into DataFrames
     extracted_tables = []
     for idx, tbl in enumerate(soup.find_all("table"), start=1):
         try:
@@ -147,7 +164,7 @@ def process_crawl4ai_result(result, url: str, base_domain: str) -> dict:
         if norm and norm not in outlinks:
             outlinks.append(norm)
 
-    # 6. Contact Emails & Social
+    # 6. Contact Emails
     emails = list(set(re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content)))
     clean_emails = [e for e in emails if not e.endswith(('.png', '.jpg', '.webp', '.js', '.svg', '.css'))]
 
@@ -179,15 +196,9 @@ def process_crawl4ai_result(result, url: str, base_domain: str) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# ADAPTIVE ASYNC CRAWL4AI RUNNER
+# ENGINE RUNNERS
 # -----------------------------------------------------------------------------
-async def run_adaptive_crawl4ai(
-    seed_url: str,
-    max_pages: int = 1,
-    max_depth: int = 2,
-    progress_bar = None,
-    status_text = None
-) -> list[dict]:
+async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text) -> list[dict]:
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
 
@@ -211,7 +222,6 @@ async def run_adaptive_crawl4ai(
     visited = set()
     results = []
 
-    # Initialize Frontier with Seed
     visited.add(seed_url)
     heapq.heappush(frontier, FrontierItem(100.0, seed_url, 0))
 
@@ -219,19 +229,18 @@ async def run_adaptive_crawl4ai(
         while frontier and len(results) < max_pages:
             item = heapq.heappop(frontier)
             if status_text:
-                status_text.text(f"⚡ Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+                status_text.text(f"⚡ [Crawl4AI] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
 
             start_t = time.time()
             res = await crawler.arun(url=item.url, config=crawler_run_config)
             duration = round(time.time() - start_t, 2)
 
             if res.success:
-                page_data = process_crawl4ai_result(res, item.url, base_domain)
+                page_data = extract_multimodal_data(res.html or "", res.markdown or "", item.url, base_domain)
                 page_data["status"] = "SUCCESS"
                 page_data["fetch_time_sec"] = duration
                 results.append(page_data)
 
-                # Feed newly discovered links back into the Scored Priority Frontier
                 if item.depth < max_depth:
                     for link in page_data["links"]:
                         if link not in visited:
@@ -245,11 +254,65 @@ async def run_adaptive_crawl4ai(
     return results
 
 
+async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text) -> list[dict]:
+    parsed = urlparse(seed_url)
+    base_domain = parsed.netloc
+
+    frontier: list[FrontierItem] = []
+    visited = set()
+    results = []
+
+    visited.add(seed_url)
+    heapq.heappush(frontier, FrontierItem(100.0, seed_url, 0))
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=25) as session:
+        while frontier and len(results) < max_pages:
+            item = heapq.heappop(frontier)
+            if status_text:
+                status_text.text(f"🚀 [Fast TLS] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+
+            start_t = time.time()
+            try:
+                resp = await session.get(item.url)
+                duration = round(time.time() - start_t, 2)
+                if resp.status_code == 200:
+                    page_data = extract_multimodal_data(resp.text, None, item.url, base_domain)
+                    page_data["status"] = "SUCCESS"
+                    page_data["fetch_time_sec"] = duration
+                    results.append(page_data)
+
+                    if item.depth < max_depth:
+                        for link in page_data["links"]:
+                            if link not in visited:
+                                visited.add(link)
+                                score = calculate_url_priority(link, item.depth + 1)
+                                heapq.heappush(frontier, FrontierItem(score, link, item.depth + 1))
+            except Exception as e:
+                st.warning(f"Error fetching {item.url}: {e}")
+
+            if progress_bar:
+                progress_bar.progress(len(results) / max_pages)
+
+    return results
+
+
 # -----------------------------------------------------------------------------
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Adaptive Frontier Web Extractor</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Advanced Priority-Queue Frontier Crawling powered by Crawl4AI & Async JS Evaluation.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Advanced Priority-Queue Frontier Engine with multi-modal structured extraction.</div>', unsafe_allow_html=True)
+
+# Engine Status banner
+if CRAWL4AI_AVAILABLE:
+    st.success("✅ **Crawl4AI Dynamic Engine Active** (Full JS Rendering & Browser Automation)")
+else:
+    st.info("⚡ **Fast Stealth TLS Engine Active** (`curl_cffi` Chrome124 Fingerprint). *Tip: If you want Crawl4AI on Streamlit Cloud, reboot your app via 'Manage app' -> '...' -> 'Reboot app' to finalize package installation.*")
 
 col1, col2 = st.columns([5, 1])
 with col1:
@@ -268,18 +331,44 @@ if start_btn and target_url:
 
     progress = st.progress(0.0)
     status = st.empty()
-    status.text("Initializing Crawl4AI browser session...")
+    status.text("Initializing crawler session...")
 
     start_total_t = time.time()
-    crawled_data = asyncio.run(
-        run_adaptive_crawl4ai(
-            seed_url=target_url,
-            max_pages=1,
-            max_depth=1,
-            progress_bar=progress,
-            status_text=status
+
+    # Execute with Crawl4AI if available, else smooth fallback
+    if CRAWL4AI_AVAILABLE:
+        try:
+            crawled_data = asyncio.run(
+                crawl_with_crawl4ai(
+                    seed_url=target_url,
+                    max_pages=1,
+                    max_depth=1,
+                    progress_bar=progress,
+                    status_text=status
+                )
+            )
+        except Exception as err:
+            status.text("Crawl4AI browser initializing failed, switching to High-Speed TLS Engine...")
+            crawled_data = asyncio.run(
+                crawl_with_curl_cffi(
+                    seed_url=target_url,
+                    max_pages=1,
+                    max_depth=1,
+                    progress_bar=progress,
+                    status_text=status
+                )
+            )
+    else:
+        crawled_data = asyncio.run(
+            crawl_with_curl_cffi(
+                seed_url=target_url,
+                max_pages=1,
+                max_depth=1,
+                progress_bar=progress,
+                status_text=status
+            )
         )
-    )
+
     total_duration = round(time.time() - start_total_t, 2)
     status.text(f"✅ Extraction finished in {total_duration}s")
 
