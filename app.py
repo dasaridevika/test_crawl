@@ -4,8 +4,9 @@ import re
 import time
 from urllib.parse import urljoin, urlparse
 import streamlit as st
-from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
+from markdownify import markdownify as md
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION
@@ -27,136 +28,57 @@ st.markdown("""
 
 
 # -----------------------------------------------------------------------------
-# HIGH-FIDELITY LINEAR DOM-TO-MARKDOWN CONVERTER
+# ROBUST DOM CLEANER & MARKDOWN GENERATOR
 # -----------------------------------------------------------------------------
-def is_noise_or_navigation(tag: Tag) -> bool:
-    """Detects purely mechanical UI noise (language popups, skip-to-content, empty carousels)."""
-    # Skip navigation, header, footer menus, and utility popups
-    if tag.name in ["nav", "header", "footer", "dialog"]:
-        return True
-    
-    # Check class and id attributes
-    class_id_str = f"{tag.get('class', '')} {tag.get('id', '')} {tag.get('role', '')}".lower()
-    noise_patterns = [
-        "cookie", "modal", "language-selector", "region-selector", "country-selector",
-        "skip-to-content", "banner-alert", "megamenu", "flyout-menu", "search-modal"
-    ]
-    if any(p in class_id_str for p in noise_patterns):
-        return True
-
-    return False
-
-
-def dom_to_clean_markdown(root: Tag, base_url: str) -> str:
+def clean_and_format_markdown(html_content: str) -> str:
     """
-    Recursively and linearly converts visual DOM elements into formatted Markdown.
-    - Preserves exact headline text (H1-H6)
-    - Preserves full paragraph text (P, DIV with text)
-    - Preserves bullet points (LI)
-    - Preserves contextual links with exact anchor text
-    - Strips duplicated carousel indicators ('Previous', 'Next', 'Short Description')
+    Converts HTML into clean, high-fidelity Markdown while stripping
+    carousel artifacts and language selector dumps without destroying the DOM.
     """
-    lines = []
-    seen_exact_blocks = set()
+    soup = BeautifulSoup(html_content, "html.parser")
 
-    # Decompose script, style, comments, and hidden elements
-    for el in root(["script", "style", "noscript", "svg", "iframe"]):
+    # 1. Remove non-content technical elements
+    for el in soup(["script", "style", "noscript", "svg", "iframe"]):
         el.decompose()
 
-    for comment in root.find_all(text=lambda t: isinstance(t, Comment)):
-        comment.extract()
+    # 2. Convert body to clean Markdown
+    body = soup.find("body") or soup
+    raw_md = md(str(body), heading_style="ATX", strip=["img"], bullets="-")
 
-    # Decompose language/region picker popups
-    for tag in root.find_all(["div", "section", "nav"]):
-        text_sample = tag.get_text()
-        if "Argentina" in text_sample and "Australia" in text_sample and "Belgique" in text_sample:
-            tag.decompose()
+    # 3. Post-Process & Clean Noise via Regex
+    # Strip regional country lists (e.g. Argentina Australia Belgique...)
+    cleaned_md = re.sub(
+        r"Argentina\s+Australia\s+Belgi[^\n]+",
+        "",
+        raw_md,
+        flags=re.IGNORECASE
+    )
 
-    # Process all content-bearing tags in document order
-    for el in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "a", "blockquote", "table"]):
-        # Skip if parent was already discarded
-        if not el.parent:
-            continue
+    # Strip repeated carousel slide indicators (e.g. 'Previous\nNext', 'Short Description...')
+    cleaned_md = re.sub(r"\n\s*(Previous|Next)\s*\n", "\n", cleaned_md, flags=re.IGNORECASE)
+    cleaned_md = re.sub(r"Short Description(\s*\n\s*[^\n]+\d+)+", "", cleaned_md, flags=re.IGNORECASE)
 
-        # Skip navigation containers
-        parent_noise = False
-        for p in el.parents:
-            if is_noise_or_navigation(p):
-                parent_noise = True
-                break
-        if parent_noise:
-            continue
+    # Strip navigation skip links
+    cleaned_md = re.sub(r"\[Skip to main content\]\([^\)]+\)", "", cleaned_md)
 
-        # Extract text
-        text = el.get_text(separator=" ", strip=True)
-        if not text:
-            continue
-
-        # Filter mechanical carousel noise
-        if text in ["Previous", "Next", "Short Description"] or re.match(r"^([A-Z0-9\s]{3,30}\s\d+)$", text):
-            continue
-
-        # Prevent duplicate identical consecutive blocks
-        if text in seen_exact_blocks:
-            continue
-
-        tag_name = el.name
-
-        # 1. Headings
-        if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-            level = int(tag_name[1])
-            lines.append(f"\n{'#' * level} {text}\n")
-            seen_exact_blocks.add(text)
-
-        # 2. Blockquotes
-        elif tag_name == "blockquote":
-            lines.append(f"> {text}\n")
-            seen_exact_blocks.add(text)
-
-        # 3. List items
-        elif tag_name == "li":
-            # Check if this LI is inside an actual content list, not a menu
-            if len(text) > 3:
-                lines.append(f"- {text}")
-                seen_exact_blocks.add(text)
-
-        # 4. Paragraphs and Content Divs
-        elif tag_name == "p":
-            # If paragraph contains links, convert them inline
-            p_content = text
-            for a in el.find_all("a", href=True):
-                a_text = a.get_text(strip=True)
-                href = urljoin(base_url, a["href"])
-                if a_text and href and not href.startswith(("#", "javascript:")):
-                    p_content = p_content.replace(a_text, f"[{a_text}]({href})", 1)
-            lines.append(f"{p_content}\n")
-            seen_exact_blocks.add(text)
-
-        # 5. Standalone Call-to-Action Links (e.g. 'Learn More', 'Register Now')
-        elif tag_name == "a" and el.parent.name not in ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6"]:
-            href = urljoin(base_url, el.get("href", ""))
-            if text and href and not href.startswith(("#", "javascript:")) and len(text) < 80:
-                lines.append(f"[{text}]({href})\n")
-                seen_exact_blocks.add(text)
-
-    # Format into clean readable Markdown
-    clean_lines = []
+    # 4. Clean consecutive empty lines
+    lines = []
     consecutive_empty = 0
-    for l in lines:
-        l_str = l.strip()
-        if not l_str:
+    for line in cleaned_md.splitlines():
+        line_str = line.strip()
+        if not line_str:
             consecutive_empty += 1
             if consecutive_empty <= 1:
-                clean_lines.append("")
+                lines.append("")
         else:
             consecutive_empty = 0
-            clean_lines.append(l_str)
+            lines.append(line_str)
 
-    return "\n".join(clean_lines).strip()
+    return "\n".join(lines).strip()
 
 
 def extract_website_data(html_content: str, base_url: str) -> dict:
-    """Extracts exact page content, metadata, schemas, and outlinks."""
+    """Extracts complete page content, metadata, schemas, and outlinks."""
     soup = BeautifulSoup(html_content, "html.parser")
     base_domain = urlparse(base_url).netloc
     
@@ -166,8 +88,8 @@ def extract_website_data(html_content: str, base_url: str) -> dict:
     desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
     description = desc_tag.get("content", "").strip() if desc_tag else ""
 
-    # Extract exact clean Markdown
-    clean_markdown = dom_to_clean_markdown(soup, base_url)
+    # Clean formatted Markdown
+    markdown_content = clean_and_format_markdown(html_content)
 
     # Extract all discovered internal domain links
     links = set()
@@ -191,8 +113,8 @@ def extract_website_data(html_content: str, base_url: str) -> dict:
         "title": page_title,
         "description": description,
         "url": base_url,
-        "markdown": clean_markdown,
-        "content_length": len(clean_markdown),
+        "markdown": markdown_content,
+        "content_length": len(markdown_content),
         "links": sorted(list(links)),
         "json_ld": json_ld
     }
