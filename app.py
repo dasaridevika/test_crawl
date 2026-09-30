@@ -1,17 +1,18 @@
 import asyncio
 import json
+import re
 import time
 from urllib.parse import urljoin, urlparse
 import streamlit as st
-import trafilatura
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
+from markdownify import markdownify as md
 
 # -----------------------------------------------------------------------------
-# PAGE CONFIGURATION & STYLING
+# PAGE CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Production Web Data Extractor",
+    page_title="Web Data Extractor",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -27,53 +28,63 @@ st.markdown("""
 
 
 # -----------------------------------------------------------------------------
-# STATE-OF-THE-ART EXTRACTION ENGINE (Trafilatura + Metadata Tree)
+# EXACT FULL-TEXT CONTENT EXTRACTOR
 # -----------------------------------------------------------------------------
-def extract_high_precision_content(html_content: str, url: str) -> dict:
+def extract_complete_exact_content(html_content: str, base_url: str) -> dict:
     """
-    Uses Trafilatura (industry benchmark for AI web extraction) to extract
-    exact, complete page text with zero boilerplate noise and 100% fidelity.
+    Extracts 100% of the complete content from the website:
+    - Retains every card, headline, description, link, and section
+    - Strips only true technical noise (scripts/styles) and the regional language picker list
+    - Retains full Markdown format with live links
     """
-    # 1. Trafilatura High-Fidelity Markdown Extraction
-    extracted_md = trafilatura.extract(
-        html_content,
-        url=url,
-        output_format="markdown",
-        include_links=True,
-        include_images=False,
-        include_tables=True,
-        include_comments=False,
-        favor_recall=True,          # Ensures NO content or article sections are missed
-        deduplicate=True
+    soup = BeautifulSoup(html_content, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
+
+    # 1. Remove non-content technical tags
+    for el in soup(["script", "style", "noscript", "svg", "iframe"]):
+        el.decompose()
+
+    # 2. Remove regional country/language picker clutter (e.g. Argentina Australia België...)
+    for el in soup.find_all(["div", "section", "nav"]):
+        text_sample = el.get_text()
+        if "Argentina" in text_sample and "Australia" in text_sample and "Belgique" in text_sample:
+            el.decompose()
+
+    # 3. Clean and convert complete body to Markdown
+    body = soup.find("body") or soup
+    raw_markdown = md(
+        str(body),
+        heading_style="ATX",
+        strip=["img"],
+        bullets="-"
     )
 
-    # 2. Extract Document Metadata
-    metadata = trafilatura.extract_metadata(html_content, default_url=url)
-    
-    # 3. Fallback to Beautiful Soup if Trafilatura returns empty
-    soup = BeautifulSoup(html_content, "html.parser")
-    base_domain = urlparse(url).netloc
-    
-    page_title = (metadata.title if metadata and metadata.title else None) or (soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled")
-    description = (metadata.description if metadata and metadata.description else "")
+    # 4. Clean consecutive empty lines while preserving full paragraph and section flow
+    lines = []
+    consecutive_empty = 0
+    for line in raw_markdown.splitlines():
+        clean_line = line.strip()
+        if not clean_line:
+            consecutive_empty += 1
+            if consecutive_empty <= 1:
+                lines.append("")
+        else:
+            consecutive_empty = 0
+            lines.append(clean_line)
 
-    if not extracted_md:
-        # Fallback cleaner
-        for el in soup(["script", "style", "noscript", "svg", "iframe"]):
-            el.decompose()
-        main_c = soup.find("main") or soup.find("article") or soup.find("body") or soup
-        extracted_md = main_c.get_text("\n\n", strip=True)
+    full_markdown_text = "\n".join(lines).strip()
 
-    # 4. Extract Discovered Internal Domain Links
+    # 5. Extract all internal domain links
     links = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            full_url = urljoin(url, href)
+            full_url = urljoin(base_url, href)
             if urlparse(full_url).netloc == base_domain:
                 links.add(full_url)
 
-    # 5. Extract JSON-LD Schema
+    # 6. Extract JSON-LD Schema
     json_ld = []
     for s in soup.find_all("script", type="application/ld+json"):
         try:
@@ -84,29 +95,24 @@ def extract_high_precision_content(html_content: str, url: str) -> dict:
 
     return {
         "title": page_title,
-        "description": description,
-        "url": url,
-        "markdown": extracted_md,
-        "json_ld": json_ld,
+        "url": base_url,
+        "markdown": full_markdown_text,
+        "content_length": len(full_markdown_text),
         "links": sorted(list(links)),
-        "content_length": len(extracted_md) if extracted_md else 0
+        "json_ld": json_ld
     }
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED ASYNC NETWORK LAYER (Chrome 120 TLS / JA3 / HTTP/2)
+# HIGH-SPEED ASYNC NETWORK LAYER
 # -----------------------------------------------------------------------------
-async def fetch_website(url: str) -> dict:
+async def fetch_website_content(url: str) -> dict:
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
         "Sec-CH-UA-Mobile": "?0",
         "Sec-CH-UA-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1"
     }
     try:
@@ -114,30 +120,24 @@ async def fetch_website(url: str) -> dict:
             start_t = time.time()
             resp = await session.get(url, impersonate="chrome120", timeout=25)
             duration = round(time.time() - start_t, 2)
-            
+
             if resp.status_code == 200:
-                data = extract_high_precision_content(resp.text, url)
+                data = extract_complete_exact_content(resp.text, url)
                 data["status"] = "SUCCESS"
-                data["status_code"] = 200
                 data["fetch_time_sec"] = duration
                 return data
             else:
-                return {
-                    "status": "FAILED",
-                    "status_code": resp.status_code,
-                    "error": f"Target server returned HTTP {resp.status_code}"
-                }
+                return {"status": "FAILED", "error": f"Server returned HTTP {resp.status_code}"}
     except Exception as e:
         return {"status": "ERROR", "error": str(e)}
 
 
 # -----------------------------------------------------------------------------
-# MAIN INTERFACE
+# MAIN UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Web Data Extractor</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">High-precision, full-text web data extraction powered by Trafilatura & Chrome TLS Impersonation.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Complete, high-fidelity content extraction with automatic anti-bot bypass.</div>', unsafe_allow_html=True)
 
-# URL Input Row
 col1, col2 = st.columns([5, 1])
 with col1:
     target_url = st.text_input(
@@ -153,20 +153,19 @@ if start_btn and target_url:
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
-    with st.spinner("Extracting complete text content..."):
-        result = asyncio.run(fetch_website(target_url))
+    with st.spinner("Extracting complete page content..."):
+        result = asyncio.run(fetch_website_content(target_url))
 
     st.markdown("---")
 
     if result.get("status") == "SUCCESS":
         st.markdown(f"## {result['title']}")
-        if result.get("description"):
-            st.caption(f"**Summary:** {result['description']}")
+        st.caption(f"🔗 Source: [{result['url']}]({result['url']})")
 
         # Metrics Bar
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric("Extracted Length", f"{result['content_length']:,} chars")
+            st.metric("Total Extracted Length", f"{result['content_length']:,} chars")
         with m2:
             st.metric("Fetch Time", f"{result.get('fetch_time_sec', 0)}s")
         with m3:
@@ -176,13 +175,13 @@ if start_btn and target_url:
 
         st.markdown("---")
 
-        tab_text, tab_json, tab_links = st.tabs([
+        tab_exact, tab_json, tab_links = st.tabs([
             "📄 Exact Extracted Content",
             "📊 Structured JSON",
             "🔗 Discovered Links"
         ])
 
-        with tab_text:
+        with tab_exact:
             st.markdown(result["markdown"])
 
         with tab_json:
