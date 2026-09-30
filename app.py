@@ -247,14 +247,27 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
         if time_el:
             meta_date = time_el.get("datetime") or time_el.get_text(" ", strip=True)
 
-    # 5. Extract Headings Hierarchy
+    # 5. Clean Non-Content Widgets (Navigation, Headers, Footers, Modals)
+    content_root = soup.find(id="page-content") or soup.find("main") or soup.find("body") or soup
+
+    # Remove non-content widgets (scripts, styles, headers, navigation menus, footers, region selectors, modals)
+    for tag in content_root(["script", "style", "noscript", "svg", "button", "select", "option", "header", "nav", "footer", "form", "aside"]):
+        tag.decompose()
+
+    for el in content_root.find_all(attrs={"role": re.compile(r"navigation|banner|contentinfo|dialog|alertdialog", re.I)}):
+        el.decompose()
+
+    for el in content_root.find_all(class_=re.compile(r"region-selector|country-selector|cookie|modal|drawer|newsletter-popup|banner-cookie|header-navigation|global-nav|site-header|site-footer|nav-menu|mega-menu|flyout|search-box|search-bar|menu-container|breadcrumbs", re.I)):
+        el.decompose()
+
+    # 6. Extract Headings Hierarchy (from cleaned editorial content)
     headings = []
-    for h in soup.find_all(["h1", "h2", "h3"]):
+    for h in content_root.find_all(["h1", "h2", "h3"]):
         h_text = h.get_text(" ", strip=True)
         if len(h_text) > 3 and len(h_text) < 120 and h_text not in headings:
             headings.append(h_text)
 
-    # 6. Extract Images
+    # 7. Extract Images
     images = []
     seen_imgs = set()
     for img in soup.find_all(["img", "picture", "source"]):
@@ -273,7 +286,7 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
 
     hero_image = og_image if og_image else (images[0] if images else "")
 
-    # 7. Extract Internal Links
+    # 8. Extract Internal Links
     outlinks = []
     seen_links = set()
     for a in soup.find_all("a", href=True):
@@ -282,7 +295,7 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
             seen_links.add(norm_url)
             outlinks.append(norm_url)
 
-    # 8. Tables extraction
+    # 9. Tables extraction
     extracted_tables = []
     for i, table in enumerate(soup.find_all("table")):
         try:
@@ -299,17 +312,7 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
         except Exception:
             pass
 
-    # 9. Clean Hierarchical Formatted Content Extraction
-    # Target content area (body or main page content)
-    content_root = soup.find(id="page-content") or soup.find("main") or soup.find("body") or soup
-
-    # Remove non-content widgets (scripts, styles, region selectors, modals)
-    for tag in content_root(["script", "style", "noscript", "svg", "button", "select", "option"]):
-        tag.decompose()
-
-    for el in content_root.find_all(class_=re.compile(r"region-selector|country-selector|cookie|modal|drawer|newsletter-popup|banner-cookie", re.I)):
-        el.decompose()
-
+    # 10. Clean Image URLs in Content Root
     for img in content_root.find_all("img"):
         src = (
             img.get("src") or
@@ -338,6 +341,7 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
         bullets="-"
     )
     formatted_md = re.sub(r"!\[.*?\]\(data:.*?\)", "", formatted_md)
+    formatted_md = re.sub(r"!\[\]\(\s*\)", "", formatted_md)
     formatted_md = re.sub(r"\[Skip to main content\]\(.*?\)", "", formatted_md, flags=re.IGNORECASE)
     formatted_md = re.sub(r"Accordion is (?:closed|open)[^\n.]*\.", "", formatted_md, flags=re.IGNORECASE)
     formatted_md = re.sub(r"Click to (?:expand|collapse)[^\n.]*\.", "", formatted_md, flags=re.IGNORECASE)
