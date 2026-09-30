@@ -1,5 +1,6 @@
 import asyncio
 import heapq
+import io
 import json
 import os
 import re
@@ -48,7 +49,7 @@ except ImportError:
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Enterprise High-Fidelity Web Crawler & Data Engine",
+    page_title="Enterprise Web Crawler & Structured Dataset Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -58,9 +59,9 @@ st.markdown("""
     <style>
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
-    .stMarkdown { font-size: 1.05rem; line-height: 1.75; }
-    .page-banner { background: #f8fafc; border-left: 4px solid #2563eb; padding: 14px 18px; border-radius: 6px; margin-bottom: 16px; }
-    .spotlight-card { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .record-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+    .badge-category { background: #dbeafe; color: #1e40af; padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 0.85rem; }
+    .meta-label { color: #64748b; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -192,148 +193,116 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
 
 
 # -----------------------------------------------------------------------------
-# 100% LOSSLESS HIGH-FIDELITY CONTENT EXTRACTOR
+# STRUCTURED DATASET EXTRACTOR
 # -----------------------------------------------------------------------------
-def extract_editorial_markdown(html_content: str, url: str) -> str:
-    """Extracts 100% of all headings, paragraphs, inline images, quotes, lists, and tables without data loss."""
+def infer_category(url: str, title: str) -> str:
+    """Categorizes page based on URL structure and content."""
+    url_l = url.lower()
+    if any(k in url_l for k in ["/blog", "/stories", "/post/"]):
+        return "Blog / Article"
+    if any(k in url_l for k in ["/news", "/press-releases", "/announcements"]):
+        return "News & Press"
+    if any(k in url_l for k in ["/docs", "/documentation", "/guide", "/api", "/learn"]):
+        return "Documentation & Technical"
+    if any(k in url_l for k in ["/case-studies", "/customers"]):
+        return "Case Study"
+    if any(k in url_l for k in ["/products", "/solutions", "/services", "/geforce", "/rtx"]):
+        return "Product / Solution"
+    if url.rstrip("/").count("/") <= 3 or "home" in title.lower():
+        return "Homepage / Portal"
+    return "Web Page"
+
+
+def extract_structured_record(html_content: str, url: str, base_domain: str, seed_locale: str | None = None) -> dict:
+    """Extracts a clean, tabular dataset record with Title, Summary, Author, Date, Full Text, Headings, Images, and Links."""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Remove non-content structural code (scripts, styles, headers, footers, forms)
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "button", "form", "select", "option"]):
-        tag.decompose()
-
-    # Remove cookie notices and modal overlays
-    for el in soup.find_all(class_=re.compile(r"cookie|modal|drawer|newsletter-popup|banner-cookie", re.I)):
-        el.decompose()
-
-    # Resolve relative URLs for images & links
-    for img in soup.find_all("img"):
-        src = (
-            img.get("src") or
-            img.get("data-src") or
-            img.get("data-original") or
-            img.get("data-lazy-src") or
-            img.get("data-url") or
-            (img.get("srcset", "").split()[0] if img.get("srcset") else None)
-        )
-        if src and not src.startswith("data:") and "1x1" not in src:
-            img["src"] = urljoin(url, src)
-        else:
-            img.decompose()
-
-    # Unwrap card block <a> tags so headings & paragraphs maintain their structure
-    for a in soup.find_all("a", href=True):
-        has_blocks = a.find(["h1", "h2", "h3", "h4", "h5", "h6", "div", "p"])
-        txt = a.get_text(" ", strip=True)
-        if has_blocks or (len(txt) > 40 and ("\n" in a.get_text() or len(txt.split()) > 6)):
-            a.unwrap()
-        else:
-            a["href"] = urljoin(url, a["href"])
-
-    # High-fidelity Markdown conversion
-    body = soup.find("body") or soup
-    dom_md = markdownify.markdownify(
-        str(body),
-        heading_style="ATX",
-        bullets="-",
-        strip=["script", "style", "button", "form", "select", "option"]
-    )
-
-    # Clean UI noise phrases
-    dom_md = re.sub(r"!\[.*?\]\(data:.*?\)", "", dom_md)
-    dom_md = re.sub(r"\[Skip to content\]\(.*?\)", "", dom_md, flags=re.IGNORECASE)
-    dom_md = re.sub(r"Accordion is (?:closed|open)[^\n.]*\.", "", dom_md, flags=re.IGNORECASE)
-    dom_md = re.sub(r"Click to (?:expand|collapse)[^\n.]*\.", "", dom_md, flags=re.IGNORECASE)
-    dom_md = re.sub(r"\n{3,}", "\n\n", dom_md).strip()
-
-    return dom_md
-
-
-def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_locale: str | None = None) -> dict:
-    """Extracts text, Markdown, data tables, images, metadata, JSON-LD, emails, code, and internal links."""
-    soup = BeautifulSoup(html_content, "html.parser")
-
+    # 1. Title Extraction
     title_tag = soup.find("title")
     h1_tag = soup.find("h1")
     page_title = title_tag.get_text().strip() if title_tag else (h1_tag.get_text().strip() if h1_tag else "Untitled Page")
+    page_title = re.sub(r"\s+", " ", page_title).strip()
 
-    meta_info = {
-        "title": page_title,
-        "description": "",
-        "canonical": "",
-        "og_title": "",
-        "og_description": "",
-        "og_image": "",
-        "json_ld_schemas": []
-    }
+    # 2. Metadata Extraction
+    meta_desc = ""
+    meta_author = ""
+    meta_date = ""
+    og_image = ""
+    json_ld_schemas = []
 
     for meta in soup.find_all("meta"):
         name = meta.get("name", "").lower()
         prop = meta.get("property", "").lower()
-        content = meta.get("content", "")
+        content = meta.get("content", "").strip()
 
-        if name == "description":
-            meta_info["description"] = content
-        elif prop == "og:title":
-            meta_info["og_title"] = content
-        elif prop == "og:description":
-            meta_info["og_description"] = content
-        elif prop == "og:image":
-            meta_info["og_image"] = urljoin(url, content)
+        if name in ["description", "twitter:description"] or prop in ["og:description"]:
+            if not meta_desc:
+                meta_desc = content
+        elif name in ["author", "article:author", "dc.creator", "byl"] or prop in ["og:author"]:
+            if not meta_author:
+                meta_author = content
+        elif name in ["article:published_time", "pubdate", "date", "dc.date"] or prop in ["article:published_time"]:
+            if not meta_date:
+                meta_date = content
+        elif prop in ["og:image", "twitter:image"]:
+            if not og_image:
+                og_image = urljoin(url, content)
 
-    canon = soup.find("link", rel="canonical")
-    if canon and canon.get("href"):
-        meta_info["canonical"] = urljoin(url, canon["href"])
-
+    # 3. JSON-LD Schemas Extraction
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             if s.string:
                 parsed_schema = json.loads(s.string.strip())
-                meta_info["json_ld_schemas"].append(parsed_schema)
+                json_ld_schemas.append(parsed_schema)
+                if isinstance(parsed_schema, dict):
+                    if not meta_author and "author" in parsed_schema:
+                        auth = parsed_schema["author"]
+                        meta_author = auth.get("name", "") if isinstance(auth, dict) else str(auth)
+                    if not meta_date and "datePublished" in parsed_schema:
+                        meta_date = str(parsed_schema["datePublished"])
+                    if not meta_desc and "description" in parsed_schema:
+                        meta_desc = str(parsed_schema["description"])
         except Exception:
             pass
 
-    markdown_content = extract_editorial_markdown(html_content, url)
-    raw_text_dump = "\n\n".join([p.strip() for p in soup.stripped_strings if len(p.strip()) > 3])
+    # 4. Fallback Author & Date from DOM tags
+    if not meta_author:
+        author_el = soup.find(class_=re.compile(r"author|byline|post-author|writer", re.I))
+        if author_el:
+            meta_author = author_el.get_text(" ", strip=True)
 
-    extracted_tables = []
-    for i, table in enumerate(soup.find_all("table")):
-        try:
-            dfs = pd.read_html(str(table))
-            if dfs and not dfs[0].empty:
-                df = dfs[0]
-                if df.shape[0] >= 1 and df.shape[1] >= 1:
-                    extracted_tables.append({
-                        "id": f"Table #{i+1}",
-                        "rows": len(df),
-                        "columns": len(df.columns),
-                        "dataframe": df
-                    })
-        except Exception:
-            pass
+    if not meta_date:
+        time_el = soup.find("time") or soup.find(class_=re.compile(r"date|publish|timestamp", re.I))
+        if time_el:
+            meta_date = time_el.get("datetime") or time_el.get_text(" ", strip=True)
 
+    # 5. Extract Headings & Key Topics Hierarchy
+    headings = []
+    for h in soup.find_all(["h1", "h2", "h3"]):
+        h_text = h.get_text(" ", strip=True)
+        if len(h_text) > 3 and len(h_text) < 120 and h_text not in headings:
+            headings.append(h_text)
+
+    # 6. Extract Images
     images = []
-    seen_img_urls = set()
+    seen_imgs = set()
     for img in soup.find_all(["img", "picture", "source"]):
         src = (
             img.get("src") or
             img.get("data-src") or
             img.get("data-original") or
             img.get("data-lazy-src") or
-            img.get("data-url") or
             (img.get("srcset", "").split()[0] if img.get("srcset") else None)
         )
         if src and not src.startswith("data:"):
             abs_src = urljoin(url, src)
-            if abs_src not in seen_img_urls and not abs_src.lower().endswith((".svg", ".ico", "1x1.gif", "spacer.gif")):
-                seen_img_urls.add(abs_src)
-                images.append({
-                    "src": abs_src,
-                    "alt": img.get("alt", "").strip() or "Image Asset",
-                    "width": img.get("width", ""),
-                    "height": img.get("height", "")
-                })
+            if abs_src not in seen_imgs and not abs_src.lower().endswith((".svg", ".ico", "1x1.gif", "spacer.gif")):
+                seen_imgs.add(abs_src)
+                images.append(abs_src)
 
+    hero_image = og_image if og_image else (images[0] if images else "")
+
+    # 7. Extract Internal Links
     outlinks = []
     seen_links = set()
     for a in soup.find_all("a", href=True):
@@ -342,39 +311,54 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
             seen_links.add(norm_url)
             outlinks.append(norm_url)
 
-    emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content)
-    clean_emails = list(set([e for e in emails if not e.endswith((".png", ".jpg", ".js", ".css"))]))
+    # 8. Clean Editorial Full Body Text (Lossless without script/style/nav clutter)
+    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "button", "form", "select", "option"]):
+        tag.decompose()
 
-    code_snippets = []
-    for pre in soup.find_all(["pre", "code"]):
-        c_txt = pre.get_text().strip()
-        if len(c_txt) > 20 and "\n" in c_txt and c_txt not in code_snippets:
-            code_snippets.append(c_txt)
+    for el in soup.find_all(class_=re.compile(r"cookie|modal|drawer|newsletter-popup|banner-cookie", re.I)):
+        el.decompose()
 
-    word_count = len(re.findall(r"\w+", markdown_content))
+    # Paragraphs extraction for summary & clean prose
+    paragraphs = []
+    for p in soup.find_all(["p", "li"]):
+        txt = p.get_text(" ", strip=True)
+        if len(txt) > 25:
+            paragraphs.append(txt)
+
+    full_body_text = "\n\n".join(paragraphs) if paragraphs else "\n\n".join([s.strip() for s in soup.stripped_strings if len(s.strip()) > 20])
+    
+    # Summary calculation if meta_desc is missing
+    if not meta_desc and paragraphs:
+        meta_desc = paragraphs[0][:250] + ("..." if len(paragraphs[0]) > 250 else "")
+
+    word_count = len(re.findall(r"\w+", full_body_text))
     reading_time = max(1, round(word_count / 220))
+    category = infer_category(url, page_title)
 
     return {
-        "url": url,
-        "title": page_title,
-        "markdown": markdown_content,
-        "raw_text": raw_text_dump,
-        "metadata": meta_info,
-        "word_count": word_count,
-        "reading_time_min": reading_time,
-        "tables": extracted_tables,
-        "images": images,
-        "emails": clean_emails,
-        "code_snippets": code_snippets,
-        "links": outlinks,
-        "content_length": len(markdown_content)
+        "Title": page_title,
+        "Category": category,
+        "Summary": meta_desc or "No description available",
+        "Author": meta_author or "N/A",
+        "Date": meta_date or "N/A",
+        "Word Count": word_count,
+        "Reading Time (min)": reading_time,
+        "Key Topics": ", ".join(headings[:8]) if headings else "N/A",
+        "Hero Image": hero_image,
+        "Total Images": len(images),
+        "Total Links": len(outlinks),
+        "Full Body Text": full_body_text,
+        "All Images": images,
+        "Discovered Links": outlinks,
+        "JSON-LD Schemas": json_ld_schemas,
+        "URL": url
     }
 
 
 # -----------------------------------------------------------------------------
 # HIGH-SPEED PARALLEL WORKER POOL ENGINE
 # -----------------------------------------------------------------------------
-async def crawl_entire_domain_parallel_turbo(
+async def crawl_structured_dataset_parallel(
     seed_url: str,
     status_placeholder,
     metric_placeholders: tuple,
@@ -390,7 +374,7 @@ async def crawl_entire_domain_parallel_turbo(
 
     frontier: list[FrontierItem] = []
     visited: set[str] = set([sanitized_seed])
-    results: list[dict] = []
+    records: list[dict] = []
     heapq.heappush(frontier, FrontierItem(100.0, sanitized_seed, 0))
 
     headers = {
@@ -403,7 +387,7 @@ async def crawl_entire_domain_parallel_turbo(
 
     async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=12) as session:
         if status_placeholder:
-            status_placeholder.markdown("🔍 **Preloading indexed pages** via `sitemap.xml` & `robots.txt`...")
+            status_placeholder.markdown("🔍 **Preloading indexed domain pages** via `sitemap.xml` & `robots.txt`...")
 
         sitemap_urls = await discover_sitemap_urls(session, sanitized_seed, base_domain, seed_locale)
         for s_url in sitemap_urls:
@@ -412,11 +396,11 @@ async def crawl_entire_domain_parallel_turbo(
                 heapq.heappush(frontier, FrontierItem(90.0, s_url, 1))
 
         if status_placeholder:
-            status_placeholder.markdown(f"🚀 **Parallel Turbo Crawling Active** ({concurrency} parallel workers fetching top pages)...")
+            status_placeholder.markdown(f"🚀 **Parallel Dataset Extraction Active** ({concurrency} parallel workers)...")
 
-        while frontier and len(results) < target_limit:
+        while frontier and len(records) < target_limit:
             batch: list[FrontierItem] = []
-            while frontier and len(batch) < concurrency and (len(results) + len(batch)) < target_limit:
+            while frontier and len(batch) < concurrency and (len(records) + len(batch)) < target_limit:
                 batch.append(heapq.heappop(frontier))
 
             if not batch:
@@ -428,8 +412,7 @@ async def crawl_entire_domain_parallel_turbo(
                     resp = await session.get(item.url)
                     dur = round(time.time() - t0, 2)
                     if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", "").lower():
-                        data = extract_multimodal_data(resp.text, item.url, base_domain, seed_locale)
-                        data["status"] = "SUCCESS"
+                        data = extract_structured_record(resp.text, item.url, base_domain, seed_locale)
                         data["fetch_time_sec"] = dur
                         data["depth"] = item.depth
                         return data, item.depth
@@ -441,39 +424,39 @@ async def crawl_entire_domain_parallel_turbo(
 
             for res_data, depth in batch_results:
                 if res_data:
-                    results.append(res_data)
-                    for link in res_data["links"]:
+                    records.append(res_data)
+                    for link in res_data["Discovered Links"]:
                         if link not in visited:
                             visited.add(link)
                             score = calculate_url_priority(link, depth + 1)
                             heapq.heappush(frontier, FrontierItem(score, link, depth + 1))
 
             elapsed = max(0.1, round(time.time() - start_time, 1))
-            speed = round(len(results) / elapsed, 1)
-            total_words = sum(p["word_count"] for p in results)
+            speed = round(len(records) / elapsed, 1)
+            total_words = sum(p["Word Count"] for p in records)
 
-            m1_box.metric("Pages Extracted", f"{len(results)} / {target_limit}")
-            m2_box.metric("In Queue", len(frontier))
-            m3_box.metric("Words Extracted", f"{total_words:,}")
-            m4_box.metric("Speed", f"{speed} pages/sec")
+            m1_box.metric("Pages Extracted", f"{len(records)} / {target_limit}")
+            m2_box.metric("In Frontier Queue", len(frontier))
+            m3_box.metric("Total Words", f"{total_words:,}")
+            m4_box.metric("Extraction Speed", f"{speed} pages/sec")
 
             if status_placeholder:
                 status_placeholder.markdown(
-                    f"⚡ **Parallel Extraction:** `{len(results)}/{target_limit}` pages (`{total_words:,}` words) | `{elapsed}s` elapsed ({speed} p/s)"
+                    f"⚡ **Extracted `{len(records)}/{target_limit}` Structured Records** (`{total_words:,}` words) | `{elapsed}s` elapsed ({speed} p/s)"
                 )
 
-    return results
+    return records
 
 
 # -----------------------------------------------------------------------------
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
-st.markdown('<div class="main-header">⚡ Enterprise Parallel Web Crawler & Data Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Lossless High-Fidelity Multi-Worker Engine — Extracts 100% complete formatted articles, headings, inline images, and tables.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Structured Dataset Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Extracts clean structured records (Title, Summary, Author, Date, Full Text, Headings, Images, Links) exportable to Excel, CSV, and JSON.</div>', unsafe_allow_html=True)
 
 # Engine status banner
 if CURL_CFFI_AVAILABLE:
-    st.success("✅ **32-Stream Parallel High-Fidelity Engine Active** (Chrome124 Stealth TLS + HTTP/2 Multiplexing + 100% Content Retention)")
+    st.success("✅ **32-Stream Parallel Dataset Engine Ready** (Chrome124 Stealth TLS + HTTP/2 Multiplexing + Clean Dataset Generator)")
 else:
     st.info("⚡ Standard Engine Ready.")
 
@@ -494,7 +477,7 @@ with col_scope:
         label_visibility="collapsed"
     )
 with col_btn:
-    start_btn = st.button("⚡ Start Fast Crawl", type="primary", use_container_width=True)
+    start_btn = st.button("⚡ Extract Dataset", type="primary", use_container_width=True)
 
 # Live crawling execution container
 if start_btn and target_url:
@@ -511,8 +494,8 @@ if start_btn and target_url:
 
     start_total_t = time.time()
 
-    crawled_data = asyncio.run(
-        crawl_entire_domain_parallel_turbo(
+    dataset_records = asyncio.run(
+        crawl_structured_dataset_parallel(
             seed_url=target_url,
             status_placeholder=status_box,
             metric_placeholders=(m1_slot, m2_slot, m3_slot, m4_slot),
@@ -522,200 +505,179 @@ if start_btn and target_url:
     )
 
     total_duration = round(time.time() - start_total_t, 2)
-    speed = round(len(crawled_data) / max(0.1, total_duration), 1)
-    status_box.success(f"🎉 **Crawl Completed in {total_duration}s!** Extracted {len(crawled_data)} pages ({sum(p['word_count'] for p in crawled_data):,} words) at {speed} pages/sec.")
-    st.session_state["crawled_data"] = crawled_data
+    speed = round(len(dataset_records) / max(0.1, total_duration), 1)
+    status_box.success(f"🎉 **Dataset Extraction Completed in {total_duration}s!** Extracted {len(dataset_records)} structured records ({sum(p['Word Count'] for p in dataset_records):,} total words) at {speed} pages/sec.")
+    st.session_state["dataset_records"] = dataset_records
 
 
 # Display Results from Session State
-if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
-    crawled_data = st.session_state["crawled_data"]
+if "dataset_records" in st.session_state and st.session_state["dataset_records"]:
+    dataset_records = st.session_state["dataset_records"]
     st.markdown("---")
 
-    # Global Aggregate Metrics Across All Crawled Pages
-    total_words_all = sum(p["word_count"] for p in crawled_data)
-    total_tables_all = sum(len(p["tables"]) for p in crawled_data)
-    total_images_all = sum(len(p["images"]) for p in crawled_data)
-    total_links_all = sum(len(p["links"]) for p in crawled_data)
+    # Global Aggregate Metrics Across Dataset
+    total_words_all = sum(p["Word Count"] for p in dataset_records)
+    total_images_all = sum(p["Total Images"] for p in dataset_records)
+    total_links_all = sum(p["Total Links"] for p in dataset_records)
+    article_count = sum(1 for p in dataset_records if p["Category"] in ["Blog / Article", "News & Press", "Case Study"])
 
     m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
-        st.metric("Total Pages Crawled", len(crawled_data))
+        st.metric("Total Records Extracted", len(dataset_records))
     with m2:
-        st.metric("Aggregate Word Count", f"{total_words_all:,}")
+        st.metric("Articles & News", article_count)
     with m3:
-        st.metric("Total Tables Found", total_tables_all)
+        st.metric("Total Words Extracted", f"{total_words_all:,}")
     with m4:
-        st.metric("High-Res Images", total_images_all)
+        st.metric("Total Images Discovered", f"{total_images_all:,}")
     with m5:
-        st.metric("Discovered Links", total_links_all)
+        st.metric("Total Links Mapped", f"{total_links_all:,}")
 
     st.markdown("---")
 
-    # Interactive Spotlight / Long-Form Articles Bar
-    rich_articles = sorted([p for p in crawled_data if p["word_count"] > 400], key=lambda x: x["word_count"], reverse=True)
-    if rich_articles:
-        st.markdown("### 🔥 Top In-Depth Full Articles Discovered")
-        st.caption(f"Found **{len(rich_articles)}** detailed articles/documentation pages ({sum(p['word_count'] for p in rich_articles):,} total words):")
-        
-        top_cols = st.columns(min(4, len(rich_articles)))
-        for i, top_p in enumerate(rich_articles[:4]):
-            with top_cols[i]:
-                st.markdown(f"""
-                <div class="spotlight-card">
-                    <b>📄 {top_p['title'][:40]}</b><br>
-                    <small>📝 <b>{top_p['word_count']:,} words</b> | ⏱️ {top_p.get('fetch_time_sec', 0)}s</small><br>
-                    <small>🔗 <a href="{top_p['url']}" target="_blank">Open Live URL</a></small>
-                </div>
-                """, unsafe_allow_html=True)
-
-    # Interactive Table of All Crawled Pages
-    st.markdown("### 📋 Complete Crawled Pages Index")
-    summary_df = pd.DataFrame([
+    # 📥 DATASET EXPORT SUITE (EXCEL, CSV, JSON)
+    st.markdown("### 📥 Download Structured Dataset")
+    
+    # Prepare export DataFrame
+    tabular_df = pd.DataFrame([
         {
-            "Page #": i + 1,
-            "Type": "📖 Full Article" if p["word_count"] > 500 else "📑 Directory/Page",
-            "Title": p["title"][:60],
-            "Words": p["word_count"],
-            "Images": len(p["images"]),
-            "Tables": len(p["tables"]),
-            "URL": p["url"]
+            "Title": r["Title"],
+            "Category": r["Category"],
+            "Author": r["Author"],
+            "Date": r["Date"],
+            "Word Count": r["Word Count"],
+            "Reading Time (min)": r["Reading Time (min)"],
+            "Summary": r["Summary"],
+            "Key Topics": r["Key Topics"],
+            "Hero Image": r["Hero Image"],
+            "Total Images": r["Total Images"],
+            "Total Links": r["Total Links"],
+            "URL": r["URL"],
+            "Full Body Text": r["Full Body Text"]
         }
-        for i, p in enumerate(crawled_data)
+        for r in dataset_records
     ])
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    st.markdown("---")
-
-    # Export & Search Bar
-    exp_col1, exp_col2 = st.columns([4, 1])
-    with exp_col1:
-        search_query = st.text_input("🔍 Search across all crawled pages:", placeholder="Filter by keyword (e.g. quantum, blackwell, safety, agents)...", label_visibility="collapsed")
-    with exp_col2:
-        export_payload = json.dumps([{k: v for k, v in p.items() if k != "tables"} for p in crawled_data], indent=2)
+    exp_c1, exp_c2, exp_c3 = st.columns(3)
+    
+    with exp_c1:
+        # Excel buffer
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            tabular_df.to_excel(writer, index=False, sheet_name="Crawled_Dataset")
+        excel_data = excel_buffer.getvalue()
+        
         st.download_button(
-            "📦 Export Full Dataset (JSON)",
-            data=export_payload,
-            file_name="turbo_crawl_dataset.json",
+            "📗 Download Excel Dataset (.xlsx)",
+            data=excel_data,
+            file_name="crawled_structured_dataset.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    with exp_c2:
+        csv_data = tabular_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📄 Download CSV Dataset (.csv)",
+            data=csv_data,
+            file_name="crawled_structured_dataset.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    with exp_c3:
+        json_payload = json.dumps(dataset_records, indent=2)
+        st.download_button(
+            "📦 Download JSON Dataset (.json)",
+            data=json_payload,
+            file_name="crawled_structured_dataset.json",
             mime="application/json",
             use_container_width=True
         )
 
-    # Filtered pages list
+    st.markdown("---")
+
+    # 📊 INTERACTIVE DATASET TABLE
+    st.markdown("### 📊 Interactive Dataset Grid")
+    
+    search_col, cat_col = st.columns([3, 2])
+    with search_col:
+        search_query = st.text_input("🔍 Search Dataset:", placeholder="Search title, summary, topic, or keyword...", label_visibility="collapsed")
+    with cat_col:
+        categories = ["All Categories"] + sorted(list(set(r["Category"] for r in dataset_records)))
+        selected_cat = st.selectbox("Filter Category:", options=categories, label_visibility="collapsed")
+
+    filtered_df = tabular_df.copy()
+    if selected_cat != "All Categories":
+        filtered_df = filtered_df[filtered_df["Category"] == selected_cat]
     if search_query:
-        filtered_pages = [p for p in crawled_data if search_query.lower() in p["markdown"].lower() or search_query.lower() in p["title"].lower()]
-        st.caption(f"Showing **{len(filtered_pages)}** pages matching '{search_query}'")
-    else:
-        filtered_pages = crawled_data
+        mask = (
+            filtered_df["Title"].str.contains(search_query, case=False, na=False) |
+            filtered_df["Summary"].str.contains(search_query, case=False, na=False) |
+            filtered_df["Key Topics"].str.contains(search_query, case=False, na=False) |
+            filtered_df["Full Body Text"].str.contains(search_query, case=False, na=False)
+        )
+        filtered_df = filtered_df[mask]
 
-    # Smart Page Selector: Default to highest word-count article if available, otherwise Page 1
-    default_idx = 0
-    if rich_articles and rich_articles[0] in filtered_pages:
-        default_idx = filtered_pages.index(rich_articles[0])
+    st.dataframe(
+        filtered_df[["Title", "Category", "Author", "Date", "Word Count", "Key Topics", "URL"]],
+        use_container_width=True,
+        hide_index=True
+    )
+    st.caption(f"Showing **{len(filtered_df)}** of **{len(dataset_records)}** records")
 
-    page_titles = [f"{'📖 [Article]' if p['word_count']>500 else '📑 [Page]'} #{i+1}: {p['title'][:50]} ({p['word_count']:,} w)" for i, p in enumerate(filtered_pages)]
-    selected_idx = default_idx
-    if len(filtered_pages) > 1:
-        selected_label = st.selectbox("📂 **Select Page or Full Article to Read:**", options=page_titles, index=default_idx)
-        selected_idx = page_titles.index(selected_label)
+    st.markdown("---")
 
-    if filtered_pages:
-        page = filtered_pages[selected_idx]
+    # 🔎 RECORD DETAIL INSPECTOR
+    st.markdown("### 🔎 Record Detail Inspector")
+    
+    record_titles = [f"#{i+1} [{r['Category']}] {r['Title'][:60]} ({r['Word Count']:,} words)" for i, r in enumerate(dataset_records)]
+    selected_record_label = st.selectbox("📂 **Select Record to View Details:**", options=record_titles, index=0)
+    selected_record_idx = record_titles.index(selected_record_label)
+    record = dataset_records[selected_record_idx]
 
-        st.markdown(f'<div class="page-banner"><b>Currently Reading:</b> {page["title"]}<br><small>🔗 <a href="{page["url"]}" target="_blank">{page["url"]}</a> | ⏱️ Fetched in {page.get("fetch_time_sec", 0)}s | 📝 <b>{page["word_count"]:,} words</b></small></div>', unsafe_allow_html=True)
+    # Record Detail Card
+    st.markdown(f"""
+    <div class="record-card">
+        <span class="badge-category">{record['Category']}</span>
+        <h2 style="margin-top: 8px; margin-bottom: 4px;">{record['Title']}</h2>
+        <p style="color: #475569; font-size: 1rem; margin-bottom: 12px;"><i>{record['Summary']}</i></p>
+        <div style="display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px;">
+            <div><span class="meta-label">Author:</span> {record['Author']}</div>
+            <div><span class="meta-label">Published Date:</span> {record['Date']}</div>
+            <div><span class="meta-label">Word Count:</span> {record['Word Count']:,} words (~{record['Reading Time (min)']} min read)</div>
+            <div><span class="meta-label">Source URL:</span> <a href="{record['URL']}" target="_blank">{record['URL']}</a></div>
+        </div>
+        <div><span class="meta-label">Key Topics / Headings:</span> {record['Key Topics']}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        # Multi-Modal Tabs
-        tab_text, tab_raw, tab_paginated, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
-            f"📄 Full Article / Page ({page['word_count']:,} w)",
-            "📝 Raw Lossless Text",
-            "📚 Multi-Page Reader",
-            f"📊 Tables & Data ({len(page['tables'])})",
-            f"🖼️ Images ({len(page['images'])})",
-            f"🏷️ SEO & JSON-LD ({len(page['metadata'].get('json_ld_schemas', []))})",
-            f"📞 Contacts ({len(page['emails'])})",
-            f"💻 Code ({len(page['code_snippets'])})",
-            "📦 Structured JSON",
-            f"🔗 Links ({len(page['links'])})"
-        ])
+    tab_text, tab_images, tab_links, tab_json = st.tabs([
+        "📄 Full Body Text Content",
+        f"🖼️ Images ({record['Total Images']})",
+        f"🔗 Discovered Outlinks ({record['Total Links']})",
+        "📦 Raw Structured JSON"
+    ])
 
-        with tab_text:
-            st.markdown(page["markdown"])
+    with tab_text:
+        st.text_area("Full Body Text", value=record["Full Body Text"], height=450)
 
-        with tab_raw:
-            st.markdown("### 📝 Lossless Raw Body Text Dump")
-            st.text_area("Full Unprocessed Text Content", value=page.get("raw_text", page["markdown"]), height=500)
+    with tab_images:
+        if record["All Images"]:
+            cols = st.columns(3)
+            for i, img_url in enumerate(record["All Images"][:15]):
+                with cols[i % 3]:
+                    st.image(img_url, use_container_width=True)
+                    st.caption(f"🔗 [View Image Asset]({img_url})")
+        else:
+            st.info("No images extracted for this record.")
 
-        with tab_paginated:
-            st.markdown("### 📚 Multi-Page Article Reader (Browse 10 Pages at a time)")
-            reader_page = st.number_input("Browse Batch:", min_value=1, max_value=max(1, (len(crawled_data) + 9) // 10), value=1)
-            start_p = (reader_page - 1) * 10
-            end_p = min(len(crawled_data), start_p + 10)
-            
-            for p_i in range(start_p, end_p):
-                p_obj = crawled_data[p_i]
-                with st.expander(f"📖 Page #{p_i+1}: {p_obj['title']} ({p_obj['word_count']} words)", expanded=(p_i == start_p)):
-                    st.caption(f"🔗 Source: [{p_obj['url']}]({p_obj['url']}) | ⏱️ {p_obj.get('fetch_time_sec', 0)}s")
-                    st.markdown(p_obj["markdown"])
-
-        with tab_tables:
-            if page["tables"]:
-                for tbl in page["tables"]:
-                    st.markdown(f"#### {tbl['id']} ({tbl['rows']} rows × {tbl['columns']} cols)")
-                    st.dataframe(tbl["dataframe"], use_container_width=True)
-            else:
-                st.info("No data tables or key-value structures detected on this page.")
-
-        with tab_media:
-            if page["images"]:
-                cols = st.columns(3)
-                for i, img in enumerate(page["images"][:30]):
-                    with cols[i % 3]:
-                        st.image(img["src"], caption=img["alt"][:40], use_container_width=True)
-                        st.caption(f"🔗 [View Original]({img['src']})")
-            else:
-                st.info("No high-resolution images found on this page.")
-
-        with tab_seo:
-            meta = page["metadata"]
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("**Page Title:**", meta.get("title", "N/A"))
-                st.write("**Meta Description:**", meta.get("description", "N/A"))
-                st.write("**Canonical URL:**", meta.get("canonical", "N/A"))
-            with c2:
-                st.write("**OpenGraph Title:**", meta.get("og_title", "N/A"))
-                st.write("**OpenGraph Description:**", meta.get("og_description", "N/A"))
-                if meta.get("og_image"):
-                    st.image(meta["og_image"], width=300)
-
-            schemas = meta.get("json_ld_schemas", [])
-            if schemas:
-                st.markdown("### 🧩 Structured JSON-LD Schemas")
-                for s_idx, schema_obj in enumerate(schemas, 1):
-                    s_type = schema_obj.get("@type", "Schema") if isinstance(schema_obj, dict) else "Schema"
-                    with st.expander(f"Schema #{s_idx}: {s_type}", expanded=True):
-                        st.json(schema_obj)
-
-        with tab_contacts:
-            if page["emails"]:
-                st.write("#### ✉️ Extracted Email Addresses")
-                for e in page["emails"]:
-                    st.markdown(f"- `{e}`")
-            else:
-                st.info("No explicit email addresses detected.")
-
-        with tab_code:
-            if page["code_snippets"]:
-                for c in page["code_snippets"]:
-                    st.code(c)
-            else:
-                st.info("No code snippets detected.")
-
-        with tab_json:
-            clean_json = {k: v for k, v in page.items() if k != "tables"}
-            st.json(clean_json)
-
-        with tab_links:
-            st.write(f"Found **{len(page['links'])}** prioritized internal domain links:")
-            for l in page["links"][:60]:
+    with tab_links:
+        if record["Discovered Links"]:
+            for l in record["Discovered Links"][:50]:
                 st.markdown(f"- [{l}]({l})")
+        else:
+            st.info("No outlinks found.")
+
+    with tab_json:
+        st.json(record)
