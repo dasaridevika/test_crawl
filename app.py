@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import json
 import re
 import time
@@ -6,14 +7,14 @@ from urllib.parse import urljoin, urlparse
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
-from curl_cffi.requests import AsyncSession
-from markdownify import markdownify as md
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Production Web Data Engine",
+    page_title="Adaptive Frontier Web Engine (Crawl4AI)",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -24,71 +25,68 @@ st.markdown("""
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.5rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
-    .highlight-card {
-        background-color: rgba(99, 102, 241, 0.08);
-        border: 1px solid rgba(99, 102, 241, 0.25);
-        border-radius: 8px;
-        padding: 14px;
-        margin-bottom: 15px;
-    }
     </style>
 """, unsafe_allow_html=True)
 
 
 # -----------------------------------------------------------------------------
-# FEATURE-RICH EXTRACTION ENGINE
+# PRIORITY FRONTIER DATA STRUCTURES
 # -----------------------------------------------------------------------------
-def extract_advanced_page_features(html_content: str, base_url: str) -> dict:
+class FrontierItem:
+    """Priority queue item ordered by score (highest score first)."""
+    def __init__(self, priority: float, url: str, depth: int):
+        self.priority = priority
+        self.url = url
+        self.depth = depth
+
+    def __lt__(self, other):
+        # Max-heap behavior
+        return self.priority > other.priority
+
+
+def calculate_url_priority(url: str, depth: int) -> float:
+    """Heuristic scoring: prioritizes content paths and penalizes depth."""
+    score = 100.0 - (depth * 25.0)
+    valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/"]
+    if any(k in url.lower() for k in valuable_keywords):
+        score += 35.0
+    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms"]
+    if any(k in url.lower() for k in utility_keywords):
+        score -= 20.0
+    return score
+
+
+def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> str | None:
+    """Normalizes URLs and enforces strict same-domain boundaries."""
+    if not raw_url or raw_url.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return None
+    full_url = urljoin(current_url, raw_url).split("#")[0].rstrip("/")
+    parsed = urlparse(full_url)
+    if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
+        return full_url
+    return None
+
+
+# -----------------------------------------------------------------------------
+# MULTI-MODAL EXTRACTOR FOR CRAWL4AI RESULT
+# -----------------------------------------------------------------------------
+def process_crawl4ai_result(result, url: str, base_domain: str) -> dict:
+    html_content = result.html or ""
     soup = BeautifulSoup(html_content, "html.parser")
-    base_domain = urlparse(base_url).netloc
     page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
 
-    # 1. SEO & OpenGraph / Social Metadata
-    meta_info = {
-        "title": page_title,
-        "description": "",
-        "keywords": "",
-        "author": "",
-        "og_title": "",
-        "og_description": "",
-        "og_image": "",
-        "og_type": "",
-        "twitter_card": "",
-        "canonical": ""
-    }
-    for m in soup.find_all("meta"):
-        name = m.get("name", "").lower()
-        prop = m.get("property", "").lower()
-        content = m.get("content", "").strip()
-        if not content:
-            continue
+    # 1. Clean Markdown Content (from Crawl4AI's native extraction)
+    markdown_content = result.markdown or ""
+    if not markdown_content:
+        for el in soup(["script", "style", "noscript", "svg", "iframe"]):
+            el.decompose()
+        body = soup.find("body") or soup
+        markdown_content = body.get_text("\n\n", strip=True)
 
-        if name == "description" or prop == "description":
-            meta_info["description"] = content
-        elif name == "keywords":
-            meta_info["keywords"] = content
-        elif name == "author":
-            meta_info["author"] = content
-        elif prop == "og:title":
-            meta_info["og_title"] = content
-        elif prop == "og:description":
-            meta_info["og_description"] = content
-        elif prop == "og:image":
-            meta_info["og_image"] = urljoin(base_url, content)
-        elif prop == "og:type":
-            meta_info["og_type"] = content
-        elif name == "twitter:card" or prop == "twitter:card":
-            meta_info["twitter_card"] = content
-
-    can_link = soup.find("link", rel="canonical")
-    if can_link and can_link.get("href"):
-        meta_info["canonical"] = urljoin(base_url, can_link["href"])
-
-    # 2. HTML Tables Extraction
+    # 2. Extract HTML Data Tables
     extracted_tables = []
     for idx, tbl in enumerate(soup.find_all("table"), start=1):
         try:
-            # Parse HTML table to pandas
             df_list = pd.read_html(str(tbl))
             if df_list and not df_list[0].empty:
                 df = df_list[0]
@@ -101,293 +99,280 @@ def extract_advanced_page_features(html_content: str, base_url: str) -> dict:
         except Exception:
             pass
 
-    # 3. Media & Image Gallery Extraction
+    # 3. Media Assets
     images = []
-    seen_img_urls = set()
+    seen_imgs = set()
     for img in soup.find_all("img", src=True):
-        src = img.get("src", "").strip()
-        if src and not src.startswith("data:image/svg+xml"):
-            full_src = urljoin(base_url, src)
-            if full_src not in seen_img_urls:
-                seen_img_urls.add(full_src)
-                alt = img.get("alt", "").strip() or "Image"
-                images.append({
-                    "src": full_src,
-                    "alt": alt,
-                    "width": img.get("width", "auto"),
-                    "height": img.get("height", "auto")
-                })
+        src = img["src"].strip()
+        full_src = urljoin(url, src)
+        if full_src not in seen_imgs and not full_src.startswith("data:"):
+            seen_imgs.add(full_src)
+            images.append({
+                "src": full_src,
+                "alt": img.get("alt", "").strip() or "Image Asset"
+            })
 
-    # 4. Contact Details & Social Profiles Detection
-    emails = set(re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content))
-    # Filter common asset extensions misidentified as emails
+    # 4. SEO & Social Metadata
+    meta_info = {
+        "title": page_title,
+        "description": "",
+        "og_title": "",
+        "og_description": "",
+        "og_image": "",
+        "canonical": ""
+    }
+    for m in soup.find_all("meta"):
+        name = m.get("name", "").lower()
+        prop = m.get("property", "").lower()
+        content = m.get("content", "").strip()
+        if not content:
+            continue
+        if name == "description" or prop == "description":
+            meta_info["description"] = content
+        elif prop == "og:title":
+            meta_info["og_title"] = content
+        elif prop == "og:description":
+            meta_info["og_description"] = content
+        elif prop == "og:image":
+            meta_info["og_image"] = urljoin(url, content)
+
+    can = soup.find("link", rel="canonical")
+    if can and can.get("href"):
+        meta_info["canonical"] = urljoin(url, can["href"])
+
+    # 5. Outlinks Discovery
+    outlinks = []
+    for a in soup.find_all("a", href=True):
+        norm = normalize_target_url(a["href"], base_domain, url)
+        if norm and norm not in outlinks:
+            outlinks.append(norm)
+
+    # 6. Contact Emails & Social
+    emails = list(set(re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content)))
     clean_emails = [e for e in emails if not e.endswith(('.png', '.jpg', '.webp', '.js', '.svg', '.css'))]
 
-    social_platforms = {
-        "github.com": "GitHub",
-        "linkedin.com": "LinkedIn",
-        "twitter.com": "Twitter/X",
-        "x.com": "Twitter/X",
-        "youtube.com": "YouTube",
-        "facebook.com": "Facebook",
-        "instagram.com": "Instagram",
-        "discord.gg": "Discord",
-        "discord.com": "Discord"
-    }
-    social_links = {}
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        for domain, name in social_platforms.items():
-            if domain in href and name not in social_links:
-                social_links[name] = href
-
-    # 5. Code Snippets Extraction
+    # 7. Code Snippets
     code_snippets = []
     for pre in soup.find_all(["pre", "code"]):
-        code_txt = pre.get_text().strip()
-        if len(code_txt) > 20 and "\n" in code_txt:
-            lang = pre.get("class", [""])[0] if pre.get("class") else "text"
-            if code_txt not in [c["code"] for c in code_snippets]:
-                code_snippets.append({"lang": lang, "code": code_txt})
+        c_txt = pre.get_text().strip()
+        if len(c_txt) > 20 and "\n" in c_txt and c_txt not in code_snippets:
+            code_snippets.append(c_txt)
 
-    # 6. Clean Text Content Generation
-    clean_soup = BeautifulSoup(html_content, "html.parser")
-    for el in clean_soup(["script", "style", "noscript", "svg", "iframe"]):
-        el.decompose()
-
-    body = clean_soup.find("body") or clean_soup
-    raw_md = md(str(body), heading_style="ATX", strip=["img"], bullets="-")
-
-    # Clean redundant regional/carousel noise
-    split_markers = [
-        "Cybersecurity Introducing NVIDIA Open Agent Safety Platform",
-        "Agentic AI\nNVIDIA and Palantir",
-        "Agentic AI\n\nNVIDIA and Palantir",
-        "Introducing NVIDIA Open Agent Safety Platform"
-    ]
-    clean_body = raw_md
-    for marker in split_markers:
-        if marker in clean_body:
-            idx = clean_body.find(marker)
-            clean_body = clean_body[idx:]
-            break
-
-    clean_body = re.sub(r"\b(Previous|Next)\b", "", clean_body)
-    clean_body = re.sub(r"Short Description(\s*\n\s*[^\n]+\d+)+", "", clean_body, flags=re.IGNORECASE)
-    clean_body = re.sub(r"(\n\s*[A-Z0-9\s]{3,35}\s\d+\s*\n)+", "\n", clean_body)
-
-    lines = [l.strip() for l in clean_body.splitlines() if l.strip()]
-    final_markdown = "\n\n".join(lines).strip()
-
-    # 7. Word Count & Reading Time Estimation
-    word_count = len(re.findall(r"\w+", final_markdown))
-    est_reading_time = max(1, round(word_count / 220))
-
-    # 8. Internal Domain Links
-    internal_links = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            full_url = urljoin(base_url, href)
-            if urlparse(full_url).netloc == base_domain:
-                internal_links.add(full_url)
-
-    # 9. JSON-LD Schemas
-    json_ld = []
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            if s.string:
-                json_ld.append(json.loads(s.string.strip()))
-        except Exception:
-            pass
+    # Metrics
+    word_count = len(re.findall(r"\w+", markdown_content))
+    reading_time = max(1, round(word_count / 220))
 
     return {
+        "url": url,
         "title": page_title,
-        "url": base_url,
+        "markdown": markdown_content,
         "metadata": meta_info,
         "word_count": word_count,
-        "reading_time_min": est_reading_time,
-        "markdown": final_markdown,
+        "reading_time_min": reading_time,
         "tables": extracted_tables,
         "images": images,
         "emails": clean_emails,
-        "social_links": social_links,
         "code_snippets": code_snippets,
-        "links": sorted(list(internal_links)),
-        "json_ld": json_ld,
-        "content_length": len(final_markdown)
+        "links": outlinks,
+        "content_length": len(markdown_content)
     }
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED ASYNC NETWORK LAYER
+# ADAPTIVE ASYNC CRAWL4AI RUNNER
 # -----------------------------------------------------------------------------
-async def fetch_page(url: str) -> dict:
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-CH-UA-Mobile": "?0",
-        "Sec-CH-UA-Platform": '"Windows"',
-        "Upgrade-Insecure-Requests": "1"
-    }
-    try:
-        async with AsyncSession(headers=headers) as session:
+async def run_adaptive_crawl4ai(
+    seed_url: str,
+    max_pages: int = 1,
+    max_depth: int = 2,
+    progress_bar = None,
+    status_text = None
+) -> list[dict]:
+    parsed = urlparse(seed_url)
+    base_domain = parsed.netloc
+
+    browser_config = BrowserConfig(
+        headless=True,
+        browser_type="chromium",
+        extra_args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+    )
+
+    crawler_run_config = CrawlerRunConfig(
+        session_id="adaptive_enterprise_session",
+        cache_mode=CacheMode.BYPASS,
+        wait_until="domcontentloaded",
+        page_timeout=30000,
+        remove_overlay_elements=True,
+        word_count_threshold=5,
+        js_code="window.scrollTo(0, document.body.scrollHeight/2);"
+    )
+
+    frontier: list[FrontierItem] = []
+    visited = set()
+    results = []
+
+    # Initialize Frontier with Seed
+    visited.add(seed_url)
+    heapq.heappush(frontier, FrontierItem(100.0, seed_url, 0))
+
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        while frontier and len(results) < max_pages:
+            item = heapq.heappop(frontier)
+            if status_text:
+                status_text.text(f"⚡ Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+
             start_t = time.time()
-            resp = await session.get(url, impersonate="chrome120", timeout=25)
+            res = await crawler.arun(url=item.url, config=crawler_run_config)
             duration = round(time.time() - start_t, 2)
 
-            if resp.status_code == 200:
-                data = extract_advanced_page_features(resp.text, url)
-                data["status"] = "SUCCESS"
-                data["fetch_time_sec"] = duration
-                return data
-            else:
-                return {"status": "FAILED", "error": f"Server returned HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"status": "ERROR", "error": str(e)}
+            if res.success:
+                page_data = process_crawl4ai_result(res, item.url, base_domain)
+                page_data["status"] = "SUCCESS"
+                page_data["fetch_time_sec"] = duration
+                results.append(page_data)
+
+                # Feed newly discovered links back into the Scored Priority Frontier
+                if item.depth < max_depth:
+                    for link in page_data["links"]:
+                        if link not in visited:
+                            visited.add(link)
+                            score = calculate_url_priority(link, item.depth + 1)
+                            heapq.heappush(frontier, FrontierItem(score, link, item.depth + 1))
+
+            if progress_bar:
+                progress_bar.progress(len(results) / max_pages)
+
+    return results
 
 
 # -----------------------------------------------------------------------------
-# MAIN UI
+# MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
-st.markdown('<div class="main-header">⚡ Web Data Extractor & Intelligence Studio</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Advanced multi-modal web extraction: Full Text, Data Tables, Media Assets, SEO Metadata, Contacts & Code.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚡ Adaptive Frontier Web Extractor</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Advanced Priority-Queue Frontier Crawling powered by Crawl4AI & Async JS Evaluation.</div>', unsafe_allow_html=True)
 
 col1, col2 = st.columns([5, 1])
 with col1:
     target_url = st.text_input(
         "Target URL",
-        value="https://www.nvidia.com/en-in/",
+        value="https://quotes.toscrape.com/js/",
         placeholder="https://example.com",
         label_visibility="collapsed"
     )
 with col2:
-    start_btn = st.button("🚀 Extract Data", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 Start Engine", type="primary", use_container_width=True)
 
 if start_btn and target_url:
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
-    with st.spinner("Extracting multi-modal web data..."):
-        result = asyncio.run(fetch_page(target_url))
+    progress = st.progress(0.0)
+    status = st.empty()
+    status.text("Initializing Crawl4AI browser session...")
+
+    start_total_t = time.time()
+    crawled_data = asyncio.run(
+        run_adaptive_crawl4ai(
+            seed_url=target_url,
+            max_pages=1,
+            max_depth=1,
+            progress_bar=progress,
+            status_text=status
+        )
+    )
+    total_duration = round(time.time() - start_total_t, 2)
+    status.text(f"✅ Extraction finished in {total_duration}s")
 
     st.markdown("---")
 
-    if result.get("status") == "SUCCESS":
-        st.markdown(f"## {result['title']}")
-        st.caption(f"🔗 Source: [{result['url']}]({result['url']}) | ⏱️ Fetched in {result['fetch_time_sec']}s")
+    if crawled_data:
+        page = crawled_data[0]
+        st.markdown(f"## {page['title']}")
+        st.caption(f"🔗 Source: [{page['url']}]({page['url']}) | ⏱️ Fetched in {page.get('fetch_time_sec', 0)}s")
 
         # Top Metric Cards
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
-            st.metric("Total Words", f"{result['word_count']:,}")
+            st.metric("Total Words", f"{page['word_count']:,}")
         with m2:
-            st.metric("Reading Time", f"~{result['reading_time_min']} min")
+            st.metric("Reading Time", f"~{page['reading_time_min']} min")
         with m3:
-            st.metric("Data Tables", len(result["tables"]))
+            st.metric("Data Tables", len(page["tables"]))
         with m4:
-            st.metric("Images Found", len(result["images"]))
+            st.metric("Images Found", len(page["images"]))
         with m5:
-            st.metric("Discovered Links", len(result["links"]))
+            st.metric("Discovered Links", len(page["links"]))
 
         st.markdown("---")
 
-        # Feature Tabs
+        # Organized Feature Tabs
         tab_text, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
             "📄 Full Text Content",
-            f"📊 Tables ({len(result['tables'])})",
-            f"🖼️ Media & Images ({len(result['images'])})",
+            f"📊 Tables ({len(page['tables'])})",
+            f"🖼️ Media & Images ({len(page['images'])})",
             "🏷️ SEO & Metadata",
-            f"📞 Contacts & Social ({len(result['emails']) + len(result['social_links'])})",
-            f"💻 Code Snippets ({len(result['code_snippets'])})",
+            f"📞 Contacts ({len(page['emails'])})",
+            f"💻 Code ({len(page['code_snippets'])})",
             "📦 Structured JSON",
-            f"🔗 Links ({len(result['links'])})"
+            f"🔗 Links ({len(page['links'])})"
         ])
 
-        # 1. FULL TEXT CONTENT
         with tab_text:
-            st.markdown(result["markdown"])
+            st.markdown(page["markdown"])
 
-        # 2. DATA TABLES
         with tab_tables:
-            if result["tables"]:
-                st.subheader(f"Extracted {len(result['tables'])} Data Tables:")
-                for tbl in result["tables"]:
+            if page["tables"]:
+                for tbl in page["tables"]:
                     st.markdown(f"#### {tbl['id']} ({tbl['rows']} rows × {tbl['columns']} cols)")
                     st.dataframe(tbl["dataframe"], use_container_width=True)
             else:
-                st.info("No HTML data tables (`<table>`) detected on this page.")
+                st.info("No HTML data tables found on this page.")
 
-        # 3. MEDIA & IMAGES
         with tab_media:
-            if result["images"]:
-                st.subheader(f"Found {len(result['images'])} Images & Visual Assets:")
-                img_cols = st.columns(3)
-                for idx, img in enumerate(result["images"][:30]):
-                    target_c = img_cols[idx % 3]
-                    with target_c:
-                        st.image(img["src"], caption=img["alt"][:40] if img["alt"] else "Image", use_container_width=True)
+            if page["images"]:
+                cols = st.columns(3)
+                for i, img in enumerate(page["images"][:30]):
+                    with cols[i % 3]:
+                        st.image(img["src"], caption=img["alt"][:35], use_container_width=True)
                         st.caption(f"🔗 [View Source]({img['src']})")
             else:
-                st.info("No image assets found.")
+                st.info("No images found.")
 
-        # 4. SEO & SOCIAL METADATA
         with tab_seo:
-            st.subheader("SEO & Social Graph Metadata:")
-            meta = result["metadata"]
-            c_meta1, c_meta2 = st.columns(2)
-            with c_meta1:
+            meta = page["metadata"]
+            c1, c2 = st.columns(2)
+            with c1:
                 st.write("**Title:**", meta.get("title", "N/A"))
                 st.write("**Description:**", meta.get("description", "N/A"))
-                st.write("**Author / Publisher:**", meta.get("author", "N/A"))
-                st.write("**Canonical URL:**", meta.get("canonical", "N/A"))
-            with c_meta2:
+                st.write("**Canonical:**", meta.get("canonical", "N/A"))
+            with c2:
                 st.write("**OpenGraph Title:**", meta.get("og_title", "N/A"))
-                st.write("**OpenGraph Type:**", meta.get("og_type", "N/A"))
-                st.write("**Twitter Card:**", meta.get("twitter_card", "N/A"))
+                st.write("**OpenGraph Description:**", meta.get("og_description", "N/A"))
                 if meta.get("og_image"):
-                    st.write("**Social Share Image:**")
                     st.image(meta["og_image"], width=300)
 
-        # 5. CONTACTS & SOCIAL HANDLES
         with tab_contacts:
-            st.subheader("Detected Contacts & Social Handles:")
-            c_con1, c_con2 = st.columns(2)
-            with c_con1:
-                st.write("#### ✉️ Email Addresses")
-                if result["emails"]:
-                    for e in result["emails"]:
-                        st.markdown(f"- `{e}`")
-                else:
-                    st.caption("No explicit email addresses found in markup.")
-            with c_con2:
-                st.write("#### 🌐 Social Profiles")
-                if result["social_links"]:
-                    for platform, s_url in result["social_links"].items():
-                        st.markdown(f"- **{platform}:** [{s_url}]({s_url})")
-                else:
-                    st.caption("No major social profile handles found.")
-
-        # 6. CODE SNIPPETS
-        with tab_code:
-            if result["code_snippets"]:
-                st.subheader(f"Extracted {len(result['code_snippets'])} Code / Command Blocks:")
-                for snip in result["code_snippets"]:
-                    st.code(snip["code"], language=snip.get("lang", "text"))
+            if page["emails"]:
+                st.write("#### ✉️ Extracted Email Addresses")
+                for e in page["emails"]:
+                    st.markdown(f"- `{e}`")
             else:
-                st.info("No code snippets (`<pre><code>`) found on this page.")
+                st.info("No explicit email addresses detected.")
 
-        # 7. STRUCTURED JSON
+        with tab_code:
+            if page["code_snippets"]:
+                for c in page["code_snippets"]:
+                    st.code(c)
+            else:
+                st.info("No code snippets detected.")
+
         with tab_json:
-            clean_json_result = {k: v for k, v in result.items() if k != "tables"}
-            st.json(clean_json_result)
+            clean_json = {k: v for k, v in page.items() if k != "tables"}
+            st.json(clean_json)
 
-        # 8. OUTLINKS
         with tab_links:
-            st.write(f"Found **{len(result['links'])}** internal domain links:")
-            for l in result["links"][:60]:
+            st.write(f"Found **{len(page['links'])}** prioritized internal domain links:")
+            for l in page["links"][:60]:
                 st.markdown(f"- [{l}]({l})")
-
     else:
-        st.error(f"❌ Extraction error: {result.get('error', 'Failed to fetch.')}")
+        st.error("❌ Extraction failed. Please verify the URL.")
