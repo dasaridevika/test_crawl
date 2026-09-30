@@ -19,7 +19,7 @@ import markdownify
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Enterprise Web Crawler & Structured Dataset Engine",
+    page_title="Enterprise Web Crawler & Data Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -29,6 +29,7 @@ st.markdown("""
     <style>
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
+    .stMarkdown { font-size: 1.05rem; line-height: 1.75; }
     .record-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
     .badge-category { background: #dbeafe; color: #1e40af; padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 0.85rem; }
     .meta-label { color: #64748b; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; }
@@ -163,7 +164,7 @@ async def discover_sitemap_urls(client: httpx.AsyncClient, seed_url: str, base_d
 
 
 # -----------------------------------------------------------------------------
-# STRUCTURED DATASET EXTRACTOR
+# CONTENT & STRUCTURED RECORD EXTRACTOR
 # -----------------------------------------------------------------------------
 def infer_category(url: str, title: str) -> str:
     """Categorizes page based on URL structure and content."""
@@ -184,7 +185,7 @@ def infer_category(url: str, title: str) -> str:
 
 
 def extract_structured_record(html_content: str, url: str, base_domain: str, seed_locale: str | None = None) -> dict:
-    """Extracts a clean, tabular dataset record with Title, Summary, Author, Date, Full Text, Headings, Images, and Links."""
+    """Extracts the exact full formatted content with all headings, sections, paragraphs, images, and metadata."""
     soup = BeautifulSoup(html_content, "html.parser")
 
     # 1. Title Extraction
@@ -246,7 +247,7 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
         if time_el:
             meta_date = time_el.get("datetime") or time_el.get_text(" ", strip=True)
 
-    # 5. Extract Headings & Key Topics Hierarchy
+    # 5. Extract Headings Hierarchy
     headings = []
     for h in soup.find_all(["h1", "h2", "h3"]):
         h_text = h.get_text(" ", strip=True)
@@ -281,29 +282,76 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
             seen_links.add(norm_url)
             outlinks.append(norm_url)
 
-    # 8. Clean Editorial Full Body Text (Lossless without script/style/nav clutter)
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "button", "form", "select", "option"]):
+    # 8. Tables extraction
+    extracted_tables = []
+    for i, table in enumerate(soup.find_all("table")):
+        try:
+            dfs = pd.read_html(str(table))
+            if dfs and not dfs[0].empty:
+                df = dfs[0]
+                if df.shape[0] >= 1 and df.shape[1] >= 1:
+                    extracted_tables.append({
+                        "id": f"Table #{i+1}",
+                        "rows": len(df),
+                        "columns": len(df.columns),
+                        "dataframe": df
+                    })
+        except Exception:
+            pass
+
+    # 9. Clean Hierarchical Formatted Content Extraction
+    # Target content area (body or main page content)
+    content_root = soup.find(id="page-content") or soup.find("main") or soup.find("body") or soup
+
+    # Remove non-content widgets (scripts, styles, region selectors, modals)
+    for tag in content_root(["script", "style", "noscript", "svg", "button", "select", "option"]):
         tag.decompose()
 
-    for el in soup.find_all(class_=re.compile(r"cookie|modal|drawer|newsletter-popup|banner-cookie", re.I)):
+    for el in content_root.find_all(class_=re.compile(r"region-selector|country-selector|cookie|modal|drawer|newsletter-popup|banner-cookie", re.I)):
         el.decompose()
 
-    # Paragraphs extraction for summary & clean prose
-    paragraphs = []
-    for p in soup.find_all(["p", "li"]):
-        txt = p.get_text(" ", strip=True)
-        if len(txt) > 25:
-            paragraphs.append(txt)
+    for img in content_root.find_all("img"):
+        src = (
+            img.get("src") or
+            img.get("data-src") or
+            img.get("data-original") or
+            img.get("data-lazy-src") or
+            (img.get("srcset", "").split()[0] if img.get("srcset") else None)
+        )
+        if src and not src.startswith("data:") and "1x1" not in src:
+            img["src"] = urljoin(url, src)
+        else:
+            img.decompose()
 
-    full_body_text = "\n\n".join(paragraphs) if paragraphs else "\n\n".join([s.strip() for s in soup.stripped_strings if len(s.strip()) > 20])
-    
-    # Summary calculation if meta_desc is missing
-    if not meta_desc and paragraphs:
-        meta_desc = paragraphs[0][:250] + ("..." if len(paragraphs[0]) > 250 else "")
+    # Unwrap card block <a> tags so headings & descriptions stay formatted properly
+    for a in content_root.find_all("a", href=True):
+        has_blocks = a.find(["h1", "h2", "h3", "h4", "h5", "h6", "div", "p"])
+        txt = a.get_text(" ", strip=True)
+        if has_blocks or (len(txt) > 40 and ("\n" in a.get_text() or len(txt.split()) > 6)):
+            a.unwrap()
+        else:
+            a["href"] = urljoin(url, a["href"])
 
-    word_count = len(re.findall(r"\w+", full_body_text))
+    formatted_md = markdownify.markdownify(
+        str(content_root),
+        heading_style="ATX",
+        bullets="-"
+    )
+    formatted_md = re.sub(r"!\[.*?\]\(data:.*?\)", "", formatted_md)
+    formatted_md = re.sub(r"\[Skip to main content\]\(.*?\)", "", formatted_md, flags=re.IGNORECASE)
+    formatted_md = re.sub(r"Accordion is (?:closed|open)[^\n.]*\.", "", formatted_md, flags=re.IGNORECASE)
+    formatted_md = re.sub(r"Click to (?:expand|collapse)[^\n.]*\.", "", formatted_md, flags=re.IGNORECASE)
+    formatted_md = re.sub(r"\n{3,}", "\n\n", formatted_md).strip()
+
+    # Raw full text dump
+    plain_text_dump = "\n\n".join([s.strip() for s in content_root.stripped_strings if len(s.strip()) > 15])
+
+    word_count = len(re.findall(r"\w+", formatted_md))
     reading_time = max(1, round(word_count / 220))
     category = infer_category(url, page_title)
+
+    if not meta_desc:
+        meta_desc = plain_text_dump[:250] + ("..." if len(plain_text_dump) > 250 else "")
 
     return {
         "Title": page_title,
@@ -317,7 +365,9 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
         "Hero Image": hero_image,
         "Total Images": len(images),
         "Total Links": len(outlinks),
-        "Full Body Text": full_body_text,
+        "Formatted Content": formatted_md,
+        "Plain Text": plain_text_dump,
+        "Tables": extracted_tables,
         "All Images": images,
         "Discovered Links": outlinks,
         "JSON-LD Schemas": json_ld_schemas,
@@ -326,7 +376,7 @@ def extract_structured_record(html_content: str, url: str, base_domain: str, see
 
 
 # -----------------------------------------------------------------------------
-# STANDARD DIRECT HTTP ASYNC CRAWLER (NO BROWSER IMPERSONATION)
+# STANDARD DIRECT HTTP ASYNC CRAWLER
 # -----------------------------------------------------------------------------
 async def crawl_structured_dataset_direct(
     seed_url: str,
@@ -335,9 +385,6 @@ async def crawl_structured_dataset_direct(
     target_limit: int = 100,
     concurrency: int = 24
 ) -> list[dict]:
-    """
-    Standard, transparent async HTTP client crawler using HTTP/2 connection pooling with zero browser impersonation.
-    """
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
     sanitized_seed = sanitize_url(seed_url)
@@ -350,7 +397,6 @@ async def crawl_structured_dataset_direct(
     records: list[dict] = []
     heapq.heappush(frontier, FrontierItem(100.0, sanitized_seed, 0))
 
-    # Standard transparent crawler headers
     headers = {
         "User-Agent": "EnterpriseDataEngine/1.0 (+https://example.com/bot; Web Data Extraction Engine)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -417,7 +463,7 @@ async def crawl_structured_dataset_direct(
 
             if status_placeholder:
                 status_placeholder.markdown(
-                    f"⚡ **Extracted `{len(records)}/{target_limit}` Structured Records** (`{total_words:,}` words) | `{elapsed}s` elapsed ({speed} p/s)"
+                    f"⚡ **Extracted `{len(records)}/{target_limit}` Pages** (`{total_words:,}` words) | `{elapsed}s` elapsed ({speed} p/s)"
                 )
 
     return records
@@ -426,8 +472,8 @@ async def crawl_structured_dataset_direct(
 # -----------------------------------------------------------------------------
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
-st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Structured Dataset Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Direct Standard HTTP Crawler — Extracts clean structured records without browser impersonation, exportable to Excel, CSV, and JSON.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Data Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Extracts 100% complete formatted content, headings, articles, media, and structured tables exportable to Excel, CSV, and JSON.</div>', unsafe_allow_html=True)
 
 st.success("✅ **Standard Direct HTTP Client Active** (`httpx` HTTP/2 Connection Pool — Zero Browser Impersonation)")
 
@@ -448,7 +494,7 @@ with col_scope:
         label_visibility="collapsed"
     )
 with col_btn:
-    start_btn = st.button("⚡ Extract Dataset", type="primary", use_container_width=True)
+    start_btn = st.button("⚡ Extract Content", type="primary", use_container_width=True)
 
 # Live crawling execution container
 if start_btn and target_url:
@@ -477,7 +523,7 @@ if start_btn and target_url:
 
     total_duration = round(time.time() - start_total_t, 2)
     speed = round(len(dataset_records) / max(0.1, total_duration), 1)
-    status_box.success(f"🎉 **Dataset Extraction Completed in {total_duration}s!** Extracted {len(dataset_records)} structured records ({sum(p['Word Count'] for p in dataset_records):,} total words) at {speed} pages/sec.")
+    status_box.success(f"🎉 **Crawl Completed in {total_duration}s!** Extracted {len(dataset_records)} full pages ({sum(p['Word Count'] for p in dataset_records):,} total words) at {speed} pages/sec.")
     st.session_state["dataset_records"] = dataset_records
 
 
@@ -494,20 +540,20 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
 
     m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
-        st.metric("Total Records Extracted", len(dataset_records))
+        st.metric("Total Pages Crawled", len(dataset_records))
     with m2:
         st.metric("Articles & News", article_count)
     with m3:
         st.metric("Total Words Extracted", f"{total_words_all:,}")
     with m4:
-        st.metric("Total Images Discovered", f"{total_images_all:,}")
+        st.metric("Images Discovered", f"{total_images_all:,}")
     with m5:
-        st.metric("Total Links Mapped", f"{total_links_all:,}")
+        st.metric("Links Mapped", f"{total_links_all:,}")
 
     st.markdown("---")
 
     # 📥 DATASET EXPORT SUITE (EXCEL, CSV, JSON)
-    st.markdown("### 📥 Download Structured Dataset")
+    st.markdown("### 📥 Export Extracted Dataset")
     
     tabular_df = pd.DataFrame([
         {
@@ -523,7 +569,7 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
             "Total Images": r["Total Images"],
             "Total Links": r["Total Links"],
             "URL": r["URL"],
-            "Full Body Text": r["Full Body Text"]
+            "Formatted Content": r["Formatted Content"]
         }
         for r in dataset_records
     ])
@@ -539,7 +585,7 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
         st.download_button(
             "📗 Download Excel Dataset (.xlsx)",
             data=excel_data,
-            file_name="crawled_structured_dataset.xlsx",
+            file_name="crawled_dataset.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
@@ -549,17 +595,18 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
         st.download_button(
             "📄 Download CSV Dataset (.csv)",
             data=csv_data,
-            file_name="crawled_structured_dataset.csv",
+            file_name="crawled_dataset.csv",
             mime="text/csv",
             use_container_width=True
         )
 
     with exp_c3:
-        json_payload = json.dumps(dataset_records, indent=2)
+        clean_json_records = [{k: v for k, v in r.items() if k != "Tables"} for r in dataset_records]
+        json_payload = json.dumps(clean_json_records, indent=2)
         st.download_button(
             "📦 Download JSON Dataset (.json)",
             data=json_payload,
-            file_name="crawled_structured_dataset.json",
+            file_name="crawled_dataset.json",
             mime="application/json",
             use_container_width=True
         )
@@ -584,7 +631,7 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
             filtered_df["Title"].str.contains(search_query, case=False, na=False) |
             filtered_df["Summary"].str.contains(search_query, case=False, na=False) |
             filtered_df["Key Topics"].str.contains(search_query, case=False, na=False) |
-            filtered_df["Full Body Text"].str.contains(search_query, case=False, na=False)
+            filtered_df["Formatted Content"].str.contains(search_query, case=False, na=False)
         )
         filtered_df = filtered_df[mask]
 
@@ -597,15 +644,15 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
 
     st.markdown("---")
 
-    # 🔎 RECORD DETAIL INSPECTOR
-    st.markdown("### 🔎 Record Detail Inspector")
+    # 🔎 PAGE CONTENT INSPECTOR
+    st.markdown("### 🔎 Page Content Inspector")
     
     record_titles = [f"#{i+1} [{r['Category']}] {r['Title'][:60]} ({r['Word Count']:,} words)" for i, r in enumerate(dataset_records)]
-    selected_record_label = st.selectbox("📂 **Select Record to View Details:**", options=record_titles, index=0)
+    selected_record_label = st.selectbox("📂 **Select Page to View Exact Content:**", options=record_titles, index=0)
     selected_record_idx = record_titles.index(selected_record_label)
     record = dataset_records[selected_record_idx]
 
-    # Record Detail Card
+    # Record Metadata Header
     st.markdown(f"""
     <div class="record-card">
         <span class="badge-category">{record['Category']}</span>
@@ -621,15 +668,28 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
     </div>
     """, unsafe_allow_html=True)
 
-    tab_text, tab_images, tab_links, tab_json = st.tabs([
-        "📄 Full Body Text Content",
+    tab_rendered, tab_plain, tab_tables, tab_images, tab_links, tab_json = st.tabs([
+        "📄 Rendered Content (Exact Site Layout)",
+        "📝 Plain Text Copy",
+        f"📊 Tables ({len(record['Tables'])})",
         f"🖼️ Images ({record['Total Images']})",
         f"🔗 Discovered Outlinks ({record['Total Links']})",
-        "📦 Raw Structured JSON"
+        "📦 Structured JSON"
     ])
 
-    with tab_text:
-        st.text_area("Full Body Text", value=record["Full Body Text"], height=450)
+    with tab_rendered:
+        st.markdown(record["Formatted Content"])
+
+    with tab_plain:
+        st.text_area("Plain Text Content", value=record["Plain Text"], height=450)
+
+    with tab_tables:
+        if record["Tables"]:
+            for tbl in record["Tables"]:
+                st.markdown(f"#### {tbl['id']} ({tbl['rows']} rows × {tbl['columns']} cols)")
+                st.dataframe(tbl["dataframe"], use_container_width=True)
+        else:
+            st.info("No data tables found on this page.")
 
     with tab_images:
         if record["All Images"]:
@@ -649,4 +709,5 @@ if "dataset_records" in st.session_state and st.session_state["dataset_records"]
             st.info("No outlinks found.")
 
     with tab_json:
-        st.json(record)
+        clean_rec = {k: v for k, v in record.items() if k != "Tables"}
+        st.json(clean_rec)
