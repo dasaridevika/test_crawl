@@ -54,7 +54,7 @@ except ImportError:
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Enterprise Web Crawler & Data Engine",
+    page_title="Enterprise Web Crawler & Multi-Page Data Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -65,7 +65,7 @@ st.markdown("""
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
-    .metric-card { background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 8px; padding: 12px; }
+    .page-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -107,6 +107,9 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     return None
 
 
+# -----------------------------------------------------------------------------
+# MULTI-MODAL CONTENT EXTRACTOR
+# -----------------------------------------------------------------------------
 def extract_editorial_markdown(html_content: str, url: str) -> str:
     """Extracts complete clean editorial copy, preserving all page sections."""
     soup = BeautifulSoup(html_content, "html.parser")
@@ -154,7 +157,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
 
     dom_md = re.sub(r"\n{3,}", "\n\n", dom_md).strip()
 
-    # 6. If Trafilatura is available and matches full content scope, we can compare
+    # 6. If Trafilatura captures dedicated long-form article body cleanly
     if TRAFILATURA_AVAILABLE:
         try:
             traf_md = trafilatura.extract(
@@ -166,7 +169,6 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
                 include_tables=True,
                 favor_precision=True
             )
-            # Use Trafilatura only if it captures most of the page text (single long-form article)
             if traf_md and len(traf_md.strip()) > 0.7 * len(dom_md):
                 return traf_md.strip()
         except Exception:
@@ -198,7 +200,6 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
         except Exception:
             pass
 
-    # Extract Definition lists (<dl>) as key-value tables
     for d_idx, dl in enumerate(soup.find_all("dl"), start=1):
         dts = [dt.get_text(strip=True) for dt in dl.find_all("dt")]
         dds = [dd.get_text(strip=True) for dd in dl.find_all("dd")]
@@ -217,7 +218,6 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
     for img in soup.find_all("img", src=True):
         src = img["src"].strip()
         full_src = urljoin(url, src)
-        # Filter out tracking pixels and base64 strings
         if full_src.startswith(("http://", "https://")) and full_src not in seen_imgs:
             if not any(noise in full_src.lower() for noise in ["pixel.gif", "spacer.gif", "blank.gif", "1x1"]):
                 seen_imgs.add(full_src)
@@ -255,7 +255,6 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
     if can and can.get("href"):
         meta_info["canonical"] = urljoin(url, can["href"])
 
-    # Extract JSON-LD structured schemas
     for s_tag in soup.find_all("script", type="application/ld+json"):
         try:
             if s_tag.string:
@@ -303,7 +302,7 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
 
 
 # -----------------------------------------------------------------------------
-# ENGINE RUNNERS
+# ENGINE RUNNERS (PRIORITY-QUEUE FRONTIER)
 # -----------------------------------------------------------------------------
 async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text) -> list[dict]:
     parsed = urlparse(seed_url)
@@ -336,7 +335,7 @@ async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, pro
         while frontier and len(results) < max_pages:
             item = heapq.heappop(frontier)
             if status_text:
-                status_text.text(f"⚡ [Crawl4AI Engine] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+                status_text.text(f"⚡ [Crawl4AI Page {len(results)+1}/{max_pages}] Fetching: {item.url[:65]}...")
 
             start_t = time.time()
             res = await crawler.arun(url=item.url, config=crawler_run_config)
@@ -382,7 +381,7 @@ async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, pr
         while frontier and len(results) < max_pages:
             item = heapq.heappop(frontier)
             if status_text:
-                status_text.text(f"🚀 [Fast TLS Engine] Fetching (Score: {item.priority:.1f}, Depth: {item.depth}): {item.url[:60]}...")
+                status_text.text(f"🚀 [Fast TLS Page {len(results)+1}/{max_pages}] Fetching: {item.url[:65]}...")
 
             start_t = time.time()
             try:
@@ -401,7 +400,7 @@ async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, pr
                                 score = calculate_url_priority(link, item.depth + 1)
                                 heapq.heappush(frontier, FrontierItem(score, link, item.depth + 1))
             except Exception as e:
-                st.warning(f"Error fetching {item.url}: {e}")
+                pass
 
             if progress_bar:
                 progress_bar.progress(len(results) / max_pages)
@@ -412,18 +411,18 @@ async def crawl_with_curl_cffi(seed_url: str, max_pages: int, max_depth: int, pr
 # -----------------------------------------------------------------------------
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
-st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Data Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Crawl4AI Dynamic Execution + Trafilatura Semantic Article Extraction + JSON-LD Schemas.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚡ Enterprise Web Crawler & Multi-Page Data Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Crawl4AI Dynamic Execution + Priority Frontier Multi-Page Deep Extraction.</div>', unsafe_allow_html=True)
 
 # Engine Status Banner
 if CRAWL4AI_AVAILABLE and TRAFILATURA_AVAILABLE:
-    st.success("✅ **Crawl4AI Dynamic Engine + Trafilatura NLP Ready** (Full Playwright JS + Precision Article Extraction)")
+    st.success("✅ **Crawl4AI Dynamic Engine Active** (Full JS Execution + Multi-Page Priority Frontier)")
 elif CRAWL4AI_AVAILABLE:
     st.success("✅ **Crawl4AI Dynamic Engine Ready** (Playwright Browser + DOM Parser)")
 else:
     st.info("⚡ **High-Speed Stealth TLS Engine Ready** (`curl_cffi` Chrome124 Fingerprint).")
 
-col1, col2 = st.columns([5, 1])
+col1, col2, col3 = st.columns([5, 2, 2])
 with col1:
     target_url = st.text_input(
         "Target URL",
@@ -432,6 +431,14 @@ with col1:
         label_visibility="collapsed"
     )
 with col2:
+    crawl_limit = st.selectbox(
+        "Pages to Crawl",
+        options=[1, 3, 5, 10],
+        index=1,
+        format_func=lambda x: f"📑 Crawl {x} Page{'s' if x > 1 else ''}",
+        label_visibility="collapsed"
+    )
+with col3:
     start_btn = st.button("🚀 Start Engine", type="primary", use_container_width=True)
 
 if start_btn and target_url:
@@ -440,19 +447,18 @@ if start_btn and target_url:
 
     progress = st.progress(0.0)
     status = st.empty()
-    status.text("Initializing crawler session...")
+    status.text("Initializing multi-page crawler session...")
 
     start_total_t = time.time()
     crawled_data = []
 
-    # Execute with Crawl4AI if available, with graceful fallback to Fast TLS
     if CRAWL4AI_AVAILABLE:
         try:
             crawled_data = asyncio.run(
                 crawl_with_crawl4ai(
                     seed_url=target_url,
-                    max_pages=1,
-                    max_depth=1,
+                    max_pages=crawl_limit,
+                    max_depth=2,
                     progress_bar=progress,
                     status_text=status
                 )
@@ -462,8 +468,8 @@ if start_btn and target_url:
             crawled_data = asyncio.run(
                 crawl_with_curl_cffi(
                     seed_url=target_url,
-                    max_pages=1,
-                    max_depth=1,
+                    max_pages=crawl_limit,
+                    max_depth=2,
                     progress_bar=progress,
                     status_text=status
                 )
@@ -472,115 +478,136 @@ if start_btn and target_url:
         crawled_data = asyncio.run(
             crawl_with_curl_cffi(
                 seed_url=target_url,
-                max_pages=1,
-                max_depth=1,
+                max_pages=crawl_limit,
+                max_depth=2,
                 progress_bar=progress,
                 status_text=status
             )
         )
 
     total_duration = round(time.time() - start_total_t, 2)
-    status.text(f"✅ Extraction finished in {total_duration}s")
+    status.text(f"✅ Extracted {len(crawled_data)} full pages in {total_duration}s")
+    st.session_state["crawled_data"] = crawled_data
+
+# Display Results from Session State
+if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
+    crawled_data = st.session_state["crawled_data"]
+    st.markdown("---")
+
+    # Global Aggregate Metrics Across All Crawled Pages
+    total_words_all = sum(p["word_count"] for p in crawled_data)
+    total_tables_all = sum(len(p["tables"]) for p in crawled_data)
+    total_images_all = sum(len(p["images"]) for p in crawled_data)
+    total_links_all = sum(len(p["links"]) for p in crawled_data)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        st.metric("Total Pages Crawled", len(crawled_data))
+    with m2:
+        st.metric("Aggregate Word Count", f"{total_words_all:,}")
+    with m3:
+        st.metric("Total Tables Found", total_tables_all)
+    with m4:
+        st.metric("High-Res Images", total_images_all)
+    with m5:
+        st.metric("Discovered Links", total_links_all)
 
     st.markdown("---")
 
-    if crawled_data:
-        page = crawled_data[0]
-        st.markdown(f"## {page['title']}")
-        st.caption(f"🔗 Source: [{page['url']}]({page['url']}) | ⏱️ Fetched in {page.get('fetch_time_sec', 0)}s")
+    # Page Selection Bar
+    page_titles = [f"Page {i+1}: {p['title'][:45]} ({p['word_count']} words)" for i, p in enumerate(crawled_data)]
+    selected_idx = 0
+    if len(crawled_data) > 1:
+        selected_label = st.selectbox("📂 **Select Page to Inspect:**", options=page_titles, index=0)
+        selected_idx = page_titles.index(selected_label)
 
-        # Top Metric Cards
-        m1, m2, m3, m4, m5 = st.columns(5)
-        with m1:
-            st.metric("Total Words", f"{page['word_count']:,}")
-        with m2:
-            st.metric("Reading Time", f"~{page['reading_time_min']} min")
-        with m3:
-            st.metric("Tables & Key-Values", len(page["tables"]))
-        with m4:
-            st.metric("High-Res Images", len(page["images"]))
-        with m5:
-            st.metric("Discovered Links", len(page["links"]))
+    page = crawled_data[selected_idx]
 
-        st.markdown("---")
+    st.markdown(f"### {page['title']}")
+    st.caption(f"🔗 URL: [{page['url']}]({page['url']}) | ⏱️ Fetched in {page.get('fetch_time_sec', 0)}s | 📝 Words: {page['word_count']:,}")
 
-        # Feature Tabs
-        tab_text, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
-            "📄 Full Text Content",
-            f"📊 Tables & Data ({len(page['tables'])})",
-            f"🖼️ Media & Images ({len(page['images'])})",
-            f"🏷️ SEO & JSON-LD ({len(page['metadata'].get('json_ld_schemas', []))})",
-            f"📞 Contacts ({len(page['emails'])})",
-            f"💻 Code ({len(page['code_snippets'])})",
-            "📦 Structured JSON",
-            f"🔗 Links ({len(page['links'])})"
-        ])
+    # Multi-Modal Tabs
+    tab_text, tab_all, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
+        "📄 Page Text Content",
+        f"📚 All {len(crawled_data)} Pages Combined",
+        f"📊 Tables & Data ({len(page['tables'])})",
+        f"🖼️ Media & Images ({len(page['images'])})",
+        f"🏷️ SEO & JSON-LD ({len(page['metadata'].get('json_ld_schemas', []))})",
+        f"📞 Contacts ({len(page['emails'])})",
+        f"💻 Code ({len(page['code_snippets'])})",
+        "📦 Structured JSON",
+        f"🔗 Links ({len(page['links'])})"
+    ])
 
-        with tab_text:
-            st.markdown(page["markdown"])
+    with tab_text:
+        st.markdown(page["markdown"])
 
-        with tab_tables:
-            if page["tables"]:
-                for tbl in page["tables"]:
-                    st.markdown(f"#### {tbl['id']} ({tbl['rows']} rows × {tbl['columns']} cols)")
-                    st.dataframe(tbl["dataframe"], use_container_width=True)
-            else:
-                st.info("No data tables or key-value structures detected.")
+    with tab_all:
+        st.markdown(f"## 📚 Consolidated Content from All {len(crawled_data)} Crawled Pages")
+        for p_i, p_obj in enumerate(crawled_data, 1):
+            with st.expander(f"📖 Page {p_i}: {p_obj['title']} ({p_obj['word_count']} words)", expanded=(p_i == 1)):
+                st.caption(f"Source: [{p_obj['url']}]({p_obj['url']})")
+                st.markdown(p_obj["markdown"])
 
-        with tab_media:
-            if page["images"]:
-                cols = st.columns(3)
-                for i, img in enumerate(page["images"][:30]):
-                    with cols[i % 3]:
-                        st.image(img["src"], caption=img["alt"][:40], use_container_width=True)
-                        st.caption(f"🔗 [View Original]({img['src']})")
-            else:
-                st.info("No high-resolution images found.")
+    with tab_tables:
+        if page["tables"]:
+            for tbl in page["tables"]:
+                st.markdown(f"#### {tbl['id']} ({tbl['rows']} rows × {tbl['columns']} cols)")
+                st.dataframe(tbl["dataframe"], use_container_width=True)
+        else:
+            st.info("No data tables or key-value structures detected on this page.")
 
-        with tab_seo:
-            meta = page["metadata"]
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("**Page Title:**", meta.get("title", "N/A"))
-                st.write("**Meta Description:**", meta.get("description", "N/A"))
-                st.write("**Canonical URL:**", meta.get("canonical", "N/A"))
-            with c2:
-                st.write("**OpenGraph Title:**", meta.get("og_title", "N/A"))
-                st.write("**OpenGraph Description:**", meta.get("og_description", "N/A"))
-                if meta.get("og_image"):
-                    st.image(meta["og_image"], width=300)
+    with tab_media:
+        if page["images"]:
+            cols = st.columns(3)
+            for i, img in enumerate(page["images"][:30]):
+                with cols[i % 3]:
+                    st.image(img["src"], caption=img["alt"][:40], use_container_width=True)
+                    st.caption(f"🔗 [View Original]({img['src']})")
+        else:
+            st.info("No high-resolution images found on this page.")
 
-            # JSON-LD Schemas Section
-            schemas = meta.get("json_ld_schemas", [])
-            if schemas:
-                st.markdown("### 🧩 Structured JSON-LD Schemas")
-                for s_idx, schema_obj in enumerate(schemas, 1):
-                    s_type = schema_obj.get("@type", "Schema") if isinstance(schema_obj, dict) else "Schema"
-                    with st.expander(f"Schema #{s_idx}: {s_type}", expanded=True):
-                        st.json(schema_obj)
+    with tab_seo:
+        meta = page["metadata"]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Page Title:**", meta.get("title", "N/A"))
+            st.write("**Meta Description:**", meta.get("description", "N/A"))
+            st.write("**Canonical URL:**", meta.get("canonical", "N/A"))
+        with c2:
+            st.write("**OpenGraph Title:**", meta.get("og_title", "N/A"))
+            st.write("**OpenGraph Description:**", meta.get("og_description", "N/A"))
+            if meta.get("og_image"):
+                st.image(meta["og_image"], width=300)
 
-        with tab_contacts:
-            if page["emails"]:
-                st.write("#### ✉️ Extracted Email Addresses")
-                for e in page["emails"]:
-                    st.markdown(f"- `{e}`")
-            else:
-                st.info("No explicit email addresses detected.")
+        schemas = meta.get("json_ld_schemas", [])
+        if schemas:
+            st.markdown("### 🧩 Structured JSON-LD Schemas")
+            for s_idx, schema_obj in enumerate(schemas, 1):
+                s_type = schema_obj.get("@type", "Schema") if isinstance(schema_obj, dict) else "Schema"
+                with st.expander(f"Schema #{s_idx}: {s_type}", expanded=True):
+                    st.json(schema_obj)
 
-        with tab_code:
-            if page["code_snippets"]:
-                for c in page["code_snippets"]:
-                    st.code(c)
-            else:
-                st.info("No code snippets detected.")
+    with tab_contacts:
+        if page["emails"]:
+            st.write("#### ✉️ Extracted Email Addresses")
+            for e in page["emails"]:
+                st.markdown(f"- `{e}`")
+        else:
+            st.info("No explicit email addresses detected.")
 
-        with tab_json:
-            clean_json = {k: v for k, v in page.items() if k != "tables"}
-            st.json(clean_json)
+    with tab_code:
+        if page["code_snippets"]:
+            for c in page["code_snippets"]:
+                st.code(c)
+        else:
+            st.info("No code snippets detected.")
 
-        with tab_links:
-            st.write(f"Found **{len(page['links'])}** prioritized internal domain links:")
-            for l in page["links"][:60]:
-                st.markdown(f"- [{l}]({l})")
-    else:
-        st.error("❌ Extraction failed. Please verify the URL.")
+    with tab_json:
+        clean_json = {k: v for k, v in page.items() if k != "tables"}
+        st.json(clean_json)
+
+    with tab_links:
+        st.write(f"Found **{len(page['links'])}** prioritized internal domain links:")
+        for l in page["links"][:60]:
+            st.markdown(f"- [{l}]({l})")
