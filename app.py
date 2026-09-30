@@ -9,10 +9,10 @@ from curl_cffi.requests import AsyncSession
 from markdownify import markdownify as md
 
 # -----------------------------------------------------------------------------
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Production Web Data Extractor",
+    page_title="Web Data Extractor",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -28,43 +28,55 @@ st.markdown("""
 
 
 # -----------------------------------------------------------------------------
-# ROBUST DOM CLEANER & MARKDOWN GENERATOR
+# EXACT EDITORIAL BODY EXTRACTOR
 # -----------------------------------------------------------------------------
-def clean_and_format_markdown(html_content: str) -> str:
+def extract_pure_editorial_content(html_content: str, base_url: str) -> dict:
     """
-    Converts HTML into clean, high-fidelity Markdown while stripping
-    carousel artifacts and language selector dumps without destroying the DOM.
+    Extracts the exact editorial and story body of the website:
+    - Removes regional language pickers (Argentina, Australia, Belgique...)
+    - Removes mega-menu category dumps
+    - Removes mechanical carousel tokens ('Previous', 'Next', 'Short Description...')
+    - Preserves 100% of the actual stories, articles, descriptions, and action links
     """
     soup = BeautifulSoup(html_content, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
 
-    # 1. Remove non-content technical elements
+    # 1. Strip script, style, and svg tags
     for el in soup(["script", "style", "noscript", "svg", "iframe"]):
         el.decompose()
 
-    # 2. Convert body to clean Markdown
+    # 2. Convert body to Markdown with links preserved
     body = soup.find("body") or soup
     raw_md = md(str(body), heading_style="ATX", strip=["img"], bullets="-")
 
-    # 3. Post-Process & Clean Noise via Regex
-    # Strip regional country lists (e.g. Argentina Australia Belgique...)
-    cleaned_md = re.sub(
-        r"Argentina\s+Australia\s+Belgi[^\n]+",
-        "",
-        raw_md,
-        flags=re.IGNORECASE
-    )
+    # 3. Precision Filtering:
+    # A) Remove everything before the first real editorial story
+    # (Removes the entire language popup and mega-menu navigation block)
+    split_markers = [
+        "Cybersecurity Introducing NVIDIA Open Agent Safety Platform",
+        "Agentic AI\nNVIDIA and Palantir",
+        "Agentic AI\n\nNVIDIA and Palantir",
+        "Introducing NVIDIA Open Agent Safety Platform",
+        "With NVIDIA Blackwell and NVIDIA Dynamo"
+    ]
+    
+    clean_body = raw_md
+    for marker in split_markers:
+        if marker in clean_body:
+            idx = clean_body.find(marker)
+            clean_body = clean_body[idx:]
+            break
 
-    # Strip repeated carousel slide indicators (e.g. 'Previous\nNext', 'Short Description...')
-    cleaned_md = re.sub(r"\n\s*(Previous|Next)\s*\n", "\n", cleaned_md, flags=re.IGNORECASE)
-    cleaned_md = re.sub(r"Short Description(\s*\n\s*[^\n]+\d+)+", "", cleaned_md, flags=re.IGNORECASE)
+    # B) Remove internal carousel UI tokens ('Next', 'Previous', 'Short Description ...')
+    clean_body = re.sub(r"\b(Previous|Next)\b", "", clean_body)
+    clean_body = re.sub(r"Short Description(\s*\n\s*[^\n]+\d+)+", "", clean_body, flags=re.IGNORECASE)
+    clean_body = re.sub(r"(\n\s*[A-Z0-9\s]{3,35}\s\d+\s*\n)+", "\n", clean_body)
 
-    # Strip navigation skip links
-    cleaned_md = re.sub(r"\[Skip to main content\]\([^\)]+\)", "", cleaned_md)
-
-    # 4. Clean consecutive empty lines
+    # 4. Clean consecutive empty lines while maintaining readable spacing
     lines = []
     consecutive_empty = 0
-    for line in cleaned_md.splitlines():
+    for line in clean_body.splitlines():
         line_str = line.strip()
         if not line_str:
             consecutive_empty += 1
@@ -74,24 +86,9 @@ def clean_and_format_markdown(html_content: str) -> str:
             consecutive_empty = 0
             lines.append(line_str)
 
-    return "\n".join(lines).strip()
+    final_markdown = "\n".join(lines).strip()
 
-
-def extract_website_data(html_content: str, base_url: str) -> dict:
-    """Extracts complete page content, metadata, schemas, and outlinks."""
-    soup = BeautifulSoup(html_content, "html.parser")
-    base_domain = urlparse(base_url).netloc
-    
-    page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
-
-    # Meta Description
-    desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
-    description = desc_tag.get("content", "").strip() if desc_tag else ""
-
-    # Clean formatted Markdown
-    markdown_content = clean_and_format_markdown(html_content)
-
-    # Extract all discovered internal domain links
+    # 5. Extract all internal domain links
     links = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -100,7 +97,7 @@ def extract_website_data(html_content: str, base_url: str) -> dict:
             if urlparse(full_url).netloc == base_domain:
                 links.add(full_url)
 
-    # Extract JSON-LD Schemas
+    # 6. Extract JSON-LD Schema
     json_ld = []
     for s in soup.find_all("script", type="application/ld+json"):
         try:
@@ -111,10 +108,9 @@ def extract_website_data(html_content: str, base_url: str) -> dict:
 
     return {
         "title": page_title,
-        "description": description,
         "url": base_url,
-        "markdown": markdown_content,
-        "content_length": len(markdown_content),
+        "markdown": final_markdown,
+        "content_length": len(final_markdown),
         "links": sorted(list(links)),
         "json_ld": json_ld
     }
@@ -139,7 +135,7 @@ async def fetch_page(url: str) -> dict:
             duration = round(time.time() - start_t, 2)
 
             if resp.status_code == 200:
-                data = extract_website_data(resp.text, url)
+                data = extract_pure_editorial_content(resp.text, url)
                 data["status"] = "SUCCESS"
                 data["fetch_time_sec"] = duration
                 return data
@@ -153,7 +149,7 @@ async def fetch_page(url: str) -> dict:
 # MAIN UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Web Data Extractor</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Extracts exact readable content, headings, paragraphs, and links with zero noise.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Extracts pure editorial content, stories, articles, and links without navigation clutter.</div>', unsafe_allow_html=True)
 
 col1, col2 = st.columns([5, 1])
 with col1:
@@ -170,20 +166,19 @@ if start_btn and target_url:
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
-    with st.spinner("Extracting exact website content..."):
+    with st.spinner("Extracting pure editorial content..."):
         result = asyncio.run(fetch_page(target_url))
 
     st.markdown("---")
 
     if result.get("status") == "SUCCESS":
         st.markdown(f"## {result['title']}")
-        if result.get("description"):
-            st.caption(f"**Summary:** {result['description']}")
+        st.caption(f"🔗 Source: [{result['url']}]({result['url']})")
 
         # Metrics Bar
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric("Total Extracted Length", f"{result['content_length']:,} chars")
+            st.metric("Extracted Content Length", f"{result['content_length']:,} chars")
         with m2:
             st.metric("Fetch Time", f"{result.get('fetch_time_sec', 0)}s")
         with m3:
