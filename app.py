@@ -7,7 +7,6 @@ import subprocess
 import sys
 import time
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
-import xml.etree.ElementTree as ET
 
 import pandas as pd
 import streamlit as st
@@ -55,7 +54,7 @@ except ImportError:
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Enterprise Full-Site Crawler & Data Engine (Unlimited)",
+    page_title="Enterprise Full-Site Crawler & Data Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -67,7 +66,6 @@ st.markdown("""
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
     .page-banner { background: #f1f5f9; border-left: 4px solid #2563eb; padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; }
-    .status-badge { background: #e0f2fe; color: #0369a1; padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 0.9rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -89,10 +87,10 @@ class FrontierItem:
 def calculate_url_priority(url: str, depth: int) -> float:
     """Prioritizes content paths (articles, docs, products) over administrative links."""
     score = 100.0 - (depth * 2.0)
-    valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/", "/case-studies/", "/solutions/"]
+    valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/", "/case-studies/", "/solutions/", "/press-releases/"]
     if any(k in url.lower() for k in valuable_keywords):
-        score += 30.0
-    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms", "/privacy"]
+        score += 35.0
+    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms", "/privacy", "/cookie"]
     if any(k in url.lower() for k in utility_keywords):
         score -= 20.0
     return score
@@ -116,7 +114,7 @@ def sanitize_url(raw_url: str) -> str:
     # Strip tracking parameters
     if parsed.query:
         qs = parse_qs(parsed.query)
-        tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref", "source", "session_id"}
+        tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref", "source", "session_id", "ncid"}
         filtered_qs = {k: v for k, v in qs.items() if k.lower() not in tracking_keys}
         clean_query = urlencode(filtered_qs, doseq=True) if filtered_qs else ""
     else:
@@ -126,7 +124,15 @@ def sanitize_url(raw_url: str) -> str:
     return clean_url
 
 
-def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> str | None:
+def get_locale_prefix(path: str) -> str | None:
+    """Identifies 2-letter or 5-letter locale codes in paths like /en-in/, /en-us/, /de-de/."""
+    m = re.match(r"^/([a-z]{2}(?:-[a-z]{2})?)/", path.lower())
+    if m:
+        return m.group(1)
+    return None
+
+
+def normalize_target_url(raw_url: str, base_domain: str, current_url: str, seed_locale: str | None = None) -> str | None:
     """Normalizes URLs and enforces apex root domain boundaries across the entire site."""
     if not raw_url or raw_url.startswith(("#", "javascript:", "mailto:", "tel:")):
         return None
@@ -140,18 +146,25 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> st
     
     if (target_netloc == base_domain.lower() or target_netloc.endswith("." + root_base) or target_netloc == root_base) and parsed.scheme in ("http", "https"):
         # Ignore binary files and media
-        if not full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe", ".iso", ".dmg")):
-            return full_url
+        if full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe", ".iso", ".dmg", ".woff", ".ttf", ".css", ".js")):
+            return None
+        
+        # If user started from a specific locale (e.g. /en-in/), avoid crawling all 40+ international language translations
+        if seed_locale:
+            url_loc = get_locale_prefix(parsed.path)
+            if url_loc and url_loc != seed_locale:
+                return None
+
+        return full_url
     return None
 
 
 # -----------------------------------------------------------------------------
 # SITEMAP DISCOVERY HELPER
 # -----------------------------------------------------------------------------
-async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base_domain: str) -> set[str]:
+async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base_domain: str, seed_locale: str | None) -> set[str]:
     """Attempts to discover all indexed URLs from sitemap.xml and robots.txt."""
     discovered = set()
-    root_base = get_root_domain(base_domain)
     parsed = urlparse(seed_url)
     base_origin = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -161,9 +174,9 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
         f"{base_origin}/robots.txt"
     ]
 
-    for s_url in candidate_sitemaps:
+    for s_url in candidate_sitemaps[:5]:
         try:
-            resp = await session.get(s_url, timeout=10)
+            resp = await session.get(s_url, timeout=8)
             if resp.status_code == 200:
                 if s_url.endswith(".txt"):
                     for line in resp.text.splitlines():
@@ -171,19 +184,15 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
                             s_target = line.split(":", 1)[1].strip()
                             candidate_sitemaps.append(s_target)
                 elif "<urlset" in resp.text or "<sitemapindex" in resp.text:
-                    try:
-                        # Extract <loc> tags
-                        locs = re.findall(r"<loc>(.*?)</loc>", resp.text, re.IGNORECASE)
-                        for loc in locs:
-                            loc = loc.strip()
-                            if loc.endswith(".xml"):
-                                candidate_sitemaps.append(loc)
-                            else:
-                                clean_loc = normalize_target_url(loc, base_domain, seed_url)
-                                if clean_loc:
-                                    discovered.add(clean_loc)
-                    except Exception:
-                        pass
+                    locs = re.findall(r"<loc>(.*?)</loc>", resp.text, re.IGNORECASE)
+                    for loc in locs:
+                        loc = loc.strip()
+                        if loc.endswith(".xml") and len(candidate_sitemaps) < 10:
+                            candidate_sitemaps.append(loc)
+                        else:
+                            clean_loc = normalize_target_url(loc, base_domain, seed_url, seed_locale)
+                            if clean_loc:
+                                discovered.add(clean_loc)
         except Exception:
             continue
 
@@ -267,7 +276,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
     return dom_md
 
 
-def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> dict:
+def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_locale: str | None = None) -> dict:
     """Extracts text, Markdown, data tables, images, metadata, JSON-LD, emails, code, and internal links."""
     soup = BeautifulSoup(html_content, "html.parser")
 
@@ -353,7 +362,7 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
     outlinks = []
     seen_links = set()
     for a in soup.find_all("a", href=True):
-        norm_url = normalize_target_url(a["href"], base_domain, url)
+        norm_url = normalize_target_url(a["href"], base_domain, url, seed_locale)
         if norm_url and norm_url not in seen_links:
             seen_links.add(norm_url)
             outlinks.append(norm_url)
@@ -395,16 +404,19 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
 async def crawl_entire_domain_unbounded(
     seed_url: str,
     status_placeholder,
-    metric_cols,
+    metric_placeholders: tuple,
     concurrency: int = 8
 ) -> list[dict]:
     """
     Crawls every single page across the entire domain with NO depth limit and NO page limit.
-    Continuously updates live metrics in Streamlit and exhausts the full domain frontier.
+    Continuously updates live metrics in-place and exhausts the full domain frontier.
     """
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
     sanitized_seed = sanitize_url(seed_url)
+    seed_locale = get_locale_prefix(parsed.path)
+
+    m1_box, m2_box, m3_box, m4_box = metric_placeholders
 
     frontier: list[FrontierItem] = []
     visited: set[str] = set([sanitized_seed])
@@ -424,14 +436,14 @@ async def crawl_entire_domain_unbounded(
         if status_placeholder:
             status_placeholder.markdown("🔍 **Step 1/2:** Discovering full site structure via `sitemap.xml` & `robots.txt`...")
 
-        sitemap_urls = await discover_sitemap_urls(session, sanitized_seed, base_domain)
+        sitemap_urls = await discover_sitemap_urls(session, sanitized_seed, base_domain, seed_locale)
         for s_url in sitemap_urls:
             if s_url not in visited:
                 visited.add(s_url)
                 heapq.heappush(frontier, FrontierItem(90.0, s_url, 1))
 
         if status_placeholder:
-            status_placeholder.markdown(f"🚀 **Step 2/2:** Crawling all discovered pages across `{base_domain}` (No depth/page limits)...")
+            status_placeholder.markdown(f"🚀 **Step 2/2:** Crawling all pages across `{base_domain}` (No depth/page limits)...")
 
         # Step 2: Unbounded Concurrent Crawl Loop
         while frontier:
@@ -446,7 +458,7 @@ async def crawl_entire_domain_unbounded(
                     resp = await session.get(item.url)
                     dur = round(time.time() - t0, 2)
                     if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", "").lower():
-                        data = extract_multimodal_data(resp.text, item.url, base_domain)
+                        data = extract_multimodal_data(resp.text, item.url, base_domain, seed_locale)
                         data["status"] = "SUCCESS"
                         data["fetch_time_sec"] = dur
                         data["depth"] = item.depth
@@ -467,24 +479,19 @@ async def crawl_entire_domain_unbounded(
                             score = calculate_url_priority(link, depth + 1)
                             heapq.heappush(frontier, FrontierItem(score, link, depth + 1))
 
-            # Update live Streamlit counters
+            # Update live Streamlit metrics in-place
             elapsed = max(0.1, round(time.time() - start_time, 1))
             speed = round(len(results) / elapsed, 1)
             total_words = sum(p["word_count"] for p in results)
 
-            if metric_cols:
-                with metric_cols[0]:
-                    st.metric("Pages Extracted", len(results))
-                with metric_cols[1]:
-                    st.metric("In Frontier Queue", len(frontier))
-                with metric_cols[2]:
-                    st.metric("Words Extracted", f"{total_words:,}")
-                with metric_cols[3]:
-                    st.metric("Speed (pages/sec)", f"{speed} p/s")
+            m1_box.metric("Pages Extracted", len(results))
+            m2_box.metric("In Frontier Queue", len(frontier))
+            m3_box.metric("Words Extracted", f"{total_words:,}")
+            m4_box.metric("Speed (pages/sec)", f"{speed} p/s")
 
             if status_placeholder:
                 status_placeholder.markdown(
-                    f"⚡ **Crawling Domain:** `{len(results)}` pages completed | `{len(frontier)}` remaining in queue | `{elapsed}s` elapsed..."
+                    f"⚡ **Live Crawling:** `{len(results)}` pages completed | `{len(frontier)}` remaining in queue | `{elapsed}s` elapsed"
                 )
 
     return results
@@ -498,7 +505,7 @@ st.markdown('<div class="sub-header">Unlimited Full-Domain Deep Crawler — Extr
 
 # Status banner
 if CURL_CFFI_AVAILABLE:
-    st.success("✅ **High-Concurrency Unlimited Full-Domain Engine Active** (Chrome124 Stealth TLS + Unlimited Frontier Traversal + Sitemap Preloader)")
+    st.success("✅ **High-Concurrency Full-Domain Engine Active** (Chrome124 Stealth TLS + Unlimited Frontier Traversal + Sitemap Preloader)")
 else:
     st.info("⚡ Standard Engine Ready.")
 
@@ -519,7 +526,13 @@ if start_btn and target_url:
         target_url = "https://" + target_url
 
     status_box = st.empty()
-    live_metrics = st.columns(4)
+    
+    # 4 distinct in-place placeholder slots for real-time metrics
+    c1, c2, c3, c4 = st.columns(4)
+    m1_slot = c1.empty()
+    m2_slot = c2.empty()
+    m3_slot = c3.empty()
+    m4_slot = c4.empty()
 
     start_total_t = time.time()
 
@@ -527,7 +540,7 @@ if start_btn and target_url:
         crawl_entire_domain_unbounded(
             seed_url=target_url,
             status_placeholder=status_box,
-            metric_cols=live_metrics,
+            metric_placeholders=(m1_slot, m2_slot, m3_slot, m4_slot),
             concurrency=8
         )
     )
