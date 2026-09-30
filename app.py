@@ -64,9 +64,9 @@ st.markdown("""
     <style>
     .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.2rem; }
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
-    .stMarkdown { font-size: 1rem; line-height: 1.7; }
-    .page-banner { background: #f1f5f9; border-left: 4px solid #2563eb; padding: 14px 18px; border-radius: 6px; margin-bottom: 16px; }
-    .spotlight-card { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .stMarkdown { font-size: 1.05rem; line-height: 1.75; }
+    .page-banner { background: #f8fafc; border-left: 4px solid #2563eb; padding: 14px 18px; border-radius: 6px; margin-bottom: 16px; }
+    .spotlight-card { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -86,14 +86,14 @@ class FrontierItem:
 
 
 def calculate_url_priority(url: str, depth: int) -> float:
-    """Prioritizes content paths (articles, docs, products, solutions) over utility pages."""
+    """Prioritizes content paths (articles, blogs, news, docs, case studies) over navigation."""
     score = 100.0 - (depth * 2.0)
-    valuable_keywords = ["/news/", "/blog/", "/article/", "/case-studies/", "/product/", "/doc/", "/data/", "/item/", "/solutions/", "/press-releases/"]
+    valuable_keywords = ["/blog/", "/news/", "/article/", "/case-studies/", "/solutions/", "/product/", "/doc/", "/press-releases/"]
     if any(k in url.lower() for k in valuable_keywords):
-        score += 45.0
-    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms", "/privacy", "/cookie"]
+        score += 50.0
+    utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms", "/privacy", "/cookie", "/contact"]
     if any(k in url.lower() for k in utility_keywords):
-        score -= 20.0
+        score -= 25.0
     return score
 
 
@@ -112,7 +112,6 @@ def sanitize_url(raw_url: str) -> str:
     if not clean_path:
         clean_path = ""
     
-    # Strip tracking parameters
     if parsed.query:
         qs = parse_qs(parsed.query)
         tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref", "source", "session_id", "ncid", "trk"}
@@ -146,11 +145,9 @@ def normalize_target_url(raw_url: str, base_domain: str, current_url: str, seed_
     target_netloc = parsed.netloc.lower()
     
     if (target_netloc == base_domain.lower() or target_netloc.endswith("." + root_base) or target_netloc == root_base) and parsed.scheme in ("http", "https"):
-        # Ignore media/binary files
         if full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe", ".iso", ".dmg", ".woff", ".woff2", ".ttf", ".css", ".js", ".ico")):
             return None
         
-        # If user started from a specific locale (e.g. /en-in/), avoid crawling 40+ international language translations
         if seed_locale:
             url_loc = get_locale_prefix(parsed.path)
             if url_loc and url_loc != seed_locale:
@@ -204,7 +201,8 @@ async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base
 # MULTI-MODAL CONTENT EXTRACTOR
 # -----------------------------------------------------------------------------
 def extract_editorial_markdown(html_content: str, url: str) -> str:
-    """Extracts complete clean editorial copy, unwrapping card link blocks and removing UI clutter."""
+    """Extracts clean formatted article or structured portal copy."""
+    # 1. Primary extractor for dedicated single-topic articles / blogs
     if TRAFILATURA_AVAILABLE:
         try:
             traf_md = trafilatura.extract(
@@ -216,61 +214,42 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
                 include_tables=True,
                 favor_precision=True
             )
-            if traf_md and len(traf_md.strip()) > 300:
+            if traf_md and len(traf_md.strip()) > 350:
                 return traf_md.strip()
         except Exception:
             pass
 
+    # 2. Fallback to clean DOM transformer for portals, indices, and product pages
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # 1. Unpack block-level <a> tags (cards) so headlines and paragraphs don't get wrapped in giant brackets
+    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "button", "form", "iframe"]):
+        tag.decompose()
+
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if src.startswith("data:") or "1x1" in src:
+            img.decompose()
+
+    for el in soup.find_all(class_=re.compile(r"indicator|tab-nav|slider-nav|sr-only|cookie|modal|drawer", re.I)):
+        el.decompose()
+
     for a in soup.find_all("a", href=True):
         has_blocks = a.find(["h1", "h2", "h3", "h4", "h5", "h6", "div", "p"])
         txt = a.get_text(" ", strip=True)
         if has_blocks or (len(txt) > 40 and ("\n" in a.get_text() or len(txt.split()) > 6)):
             a.unwrap()
+        else:
+            a["href"] = urljoin(url, a["href"])
 
-    # 2. Remove non-content structural elements
-    for el in soup.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
-        el.decompose()
-
-    # 3. Remove noise widgets
-    noise_matchers = [
-        "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control",
-        "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer",
-        "country-selector", "location-selector", "sr-only", "region-selector"
-    ]
-    for el in soup.find_all(lambda e: e.name not in ["html", "body"] and any(m in str(e.get("class", "")).lower() or m in str(e.get("id", "")).lower() for m in noise_matchers)):
-        el.decompose()
-
-    # 4. Resolve relative URLs to absolute URLs
-    for a in soup.find_all("a", href=True):
-        a["href"] = urljoin(url, a["href"])
-
-    # 5. Convert to clean Markdown
-    body = soup.find("body") or soup
     dom_md = markdownify.markdownify(
-        str(body),
+        str(soup.find("body") or soup),
         heading_style="ATX",
-        bullets="-",
-        strip=["script", "style", "button", "form", "nav", "svg", "img", "noscript", "iframe"]
+        bullets="-"
     )
 
-    # 6. Clean common UI noise patterns
-    ui_noise = [
-        r"Accordion is (?:closed|open)[^\n.]*\.",
-        r"Click to (?:expand|collapse)[^\n.]*\.",
-        r"Shopping Cart Click to see cart items",
-        r"Search icon Click to search",
-        r"Menu icon|Close icon|Caret (?:down|up|right|left) icon",
-        r"<util:I18n[^>]*>",
-        r"\b(?:Previous|Next)\s+Short Description\b",
-        r"Short Description(?:\n+[A-Za-z0-9\s_-]+)+",
-        r"Select Location\s+The Americas[\s\S]*?(?=(\n\n|\Z))"
-    ]
-    for pat in ui_noise:
-        dom_md = re.sub(pat, "", dom_md, flags=re.IGNORECASE)
-
+    dom_md = re.sub(r"!\[.*?\]\(data:.*?\)", "", dom_md)
+    dom_md = re.sub(r"Accordion is (?:closed|open)[^\n.]*\.", "", dom_md, flags=re.IGNORECASE)
+    dom_md = re.sub(r"Click to (?:expand|collapse)[^\n.]*\.", "", dom_md, flags=re.IGNORECASE)
     dom_md = re.sub(r"\n{3,}", "\n\n", dom_md).strip()
     return dom_md
 
@@ -279,12 +258,10 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
     """Extracts text, Markdown, data tables, images, metadata, JSON-LD, emails, code, and internal links."""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Title extraction
     title_tag = soup.find("title")
     h1_tag = soup.find("h1")
     page_title = title_tag.get_text().strip() if title_tag else (h1_tag.get_text().strip() if h1_tag else "Untitled Page")
 
-    # Metadata & JSON-LD Schemas
     meta_info = {
         "title": page_title,
         "description": "",
@@ -321,13 +298,9 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
         except Exception:
             pass
 
-    # Clean editorial copy
     markdown_content = extract_editorial_markdown(html_content, url)
-    
-    # Lossless raw text representation
     raw_text_dump = "\n\n".join([p.strip() for p in soup.stripped_strings if len(p.strip()) > 3])
 
-    # Tables extraction
     extracted_tables = []
     for i, table in enumerate(soup.find_all("table")):
         try:
@@ -344,7 +317,6 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
         except Exception:
             pass
 
-    # High-Res and Lazy-Loaded Images extraction
     images = []
     seen_img_urls = set()
     for img in soup.find_all(["img", "picture", "source"]):
@@ -367,7 +339,6 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
                     "height": img.get("height", "")
                 })
 
-    # Internal links discovery (including root-domain subdomains)
     outlinks = []
     seen_links = set()
     for a in soup.find_all("a", href=True):
@@ -376,18 +347,15 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
             seen_links.add(norm_url)
             outlinks.append(norm_url)
 
-    # Emails extraction
     emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content)
     clean_emails = list(set([e for e in emails if not e.endswith((".png", ".jpg", ".js", ".css"))]))
 
-    # Code snippets
     code_snippets = []
     for pre in soup.find_all(["pre", "code"]):
         c_txt = pre.get_text().strip()
         if len(c_txt) > 20 and "\n" in c_txt and c_txt not in code_snippets:
             code_snippets.append(c_txt)
 
-    # Word count and reading time
     word_count = len(re.findall(r"\w+", markdown_content))
     reading_time = max(1, round(word_count / 220))
 
@@ -409,7 +377,7 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str, seed_
 
 
 # -----------------------------------------------------------------------------
-# HIGH-SPEED PARALLEL WORKER POOL ENGINE (32 CONCURRENT HTTP/2 STREAMS)
+# HIGH-SPEED PARALLEL WORKER POOL ENGINE
 # -----------------------------------------------------------------------------
 async def crawl_entire_domain_parallel_turbo(
     seed_url: str,
@@ -418,10 +386,6 @@ async def crawl_entire_domain_parallel_turbo(
     target_limit: int = 100,
     concurrency: int = 32
 ) -> list[dict]:
-    """
-    Ultra-high-throughput parallel crawler utilizing 32 concurrent HTTP/2 stream workers.
-    Fast execution finishing within seconds.
-    """
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
     sanitized_seed = sanitize_url(seed_url)
@@ -443,7 +407,6 @@ async def crawl_entire_domain_parallel_turbo(
     start_time = time.time()
 
     async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=12) as session:
-        # Step 1: Rapid Sitemap & Robots Preloader
         if status_placeholder:
             status_placeholder.markdown("🔍 **Preloading indexed pages** via `sitemap.xml` & `robots.txt`...")
 
@@ -456,7 +419,6 @@ async def crawl_entire_domain_parallel_turbo(
         if status_placeholder:
             status_placeholder.markdown(f"🚀 **Parallel Turbo Crawling Active** ({concurrency} parallel workers fetching top pages)...")
 
-        # Step 2: High-Speed Concurrent Batch Traversal
         while frontier and len(results) < target_limit:
             batch: list[FrontierItem] = []
             while frontier and len(batch) < concurrency and (len(results) + len(batch)) < target_limit:
@@ -546,7 +508,6 @@ if start_btn and target_url:
 
     status_box = st.empty()
     
-    # 4 clean metric slots
     c1, c2, c3, c4 = st.columns(4)
     m1_slot = c1.empty()
     m2_slot = c2.empty()
@@ -596,11 +557,11 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
 
     st.markdown("---")
 
-    # Interactive Spotlight / High-Word-Count Articles Bar
+    # Interactive Spotlight / Long-Form Articles Bar
     rich_articles = sorted([p for p in crawled_data if p["word_count"] > 400], key=lambda x: x["word_count"], reverse=True)
     if rich_articles:
-        st.markdown("### 🔥 In-Depth Article Spotlight")
-        st.caption(f"Top long-form articles discovered ({len(rich_articles)} articles, {sum(p['word_count'] for p in rich_articles):,} total words):")
+        st.markdown("### 🔥 Top In-Depth Full Articles Discovered")
+        st.caption(f"Found **{len(rich_articles)}** detailed articles/documentation pages ({sum(p['word_count'] for p in rich_articles):,} total words):")
         
         top_cols = st.columns(min(4, len(rich_articles)))
         for i, top_p in enumerate(rich_articles[:4]):
@@ -609,7 +570,7 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
                 <div class="spotlight-card">
                     <b>📄 {top_p['title'][:40]}</b><br>
                     <small>📝 <b>{top_p['word_count']:,} words</b> | ⏱️ {top_p.get('fetch_time_sec', 0)}s</small><br>
-                    <small>🔗 <a href="{top_p['url']}" target="_blank">View Live URL</a></small>
+                    <small>🔗 <a href="{top_p['url']}" target="_blank">Open Live URL</a></small>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -618,11 +579,11 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
     summary_df = pd.DataFrame([
         {
             "Page #": i + 1,
+            "Type": "📖 Full Article" if p["word_count"] > 500 else "📑 Directory/Page",
             "Title": p["title"][:60],
             "Words": p["word_count"],
             "Images": len(p["images"]),
             "Tables": len(p["tables"]),
-            "Depth": p.get("depth", 0),
             "URL": p["url"]
         }
         for i, p in enumerate(crawled_data)
@@ -652,21 +613,25 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
     else:
         filtered_pages = crawled_data
 
-    # Page Selection Bar
-    page_titles = [f"Page {i+1}: {p['title'][:55]} ({p['word_count']} words)" for i, p in enumerate(filtered_pages)]
-    selected_idx = 0
+    # Smart Page Selector: Default to highest word-count article if available, otherwise Page 1
+    default_idx = 0
+    if rich_articles and rich_articles[0] in filtered_pages:
+        default_idx = filtered_pages.index(rich_articles[0])
+
+    page_titles = [f"{'📖 [Article]' if p['word_count']>500 else '📑 [Page]'} #{i+1}: {p['title'][:50]} ({p['word_count']:,} w)" for i, p in enumerate(filtered_pages)]
+    selected_idx = default_idx
     if len(filtered_pages) > 1:
-        selected_label = st.selectbox("📂 **Select Page to Read / Inspect:**", options=page_titles, index=0)
+        selected_label = st.selectbox("📂 **Select Page or Full Article to Read:**", options=page_titles, index=default_idx)
         selected_idx = page_titles.index(selected_label)
 
     if filtered_pages:
         page = filtered_pages[selected_idx]
 
-        st.markdown(f'<div class="page-banner"><b>Currently Reading:</b> {page["title"]}<br><small>🔗 <a href="{page["url"]}" target="_blank">{page["url"]}</a> | ⏱️ Fetched in {page.get("fetch_time_sec", 0)}s | 📝 {page["word_count"]:,} words</small></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="page-banner"><b>Currently Reading:</b> {page["title"]}<br><small>🔗 <a href="{page["url"]}" target="_blank">{page["url"]}</a> | ⏱️ Fetched in {page.get("fetch_time_sec", 0)}s | 📝 <b>{page["word_count"]:,} words</b></small></div>', unsafe_allow_html=True)
 
         # Multi-Modal Tabs
         tab_text, tab_raw, tab_paginated, tab_tables, tab_media, tab_seo, tab_contacts, tab_code, tab_json, tab_links = st.tabs([
-            f"📄 Clean Article ({page['word_count']:,} w)",
+            f"📄 Full Article / Page ({page['word_count']:,} w)",
             "📝 Raw Lossless Text",
             "📚 Multi-Page Reader",
             f"📊 Tables & Data ({len(page['tables'])})",
