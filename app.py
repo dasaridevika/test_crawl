@@ -6,7 +6,8 @@ import re
 import subprocess
 import sys
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import streamlit as st
@@ -54,7 +55,7 @@ except ImportError:
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Enterprise Full-Site Crawler & Data Engine",
+    page_title="Enterprise Full-Site Crawler & Data Engine (Unlimited)",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -66,12 +67,13 @@ st.markdown("""
     .sub-header { color: #888; font-size: 0.95rem; margin-bottom: 1.2rem; }
     .stMarkdown { font-size: 1rem; line-height: 1.7; }
     .page-banner { background: #f1f5f9; border-left: 4px solid #2563eb; padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; }
+    .status-badge { background: #e0f2fe; color: #0369a1; padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 0.9rem; }
     </style>
 """, unsafe_allow_html=True)
 
 
 # -----------------------------------------------------------------------------
-# PRIORITY FRONTIER DATA STRUCTURES
+# PRIORITY FRONTIER & URL NORMALIZATION
 # -----------------------------------------------------------------------------
 class FrontierItem:
     """Priority queue item ordered by score (highest score first)."""
@@ -85,11 +87,11 @@ class FrontierItem:
 
 
 def calculate_url_priority(url: str, depth: int) -> float:
-    """Heuristic scoring: prioritizes content paths and penalizes depth."""
-    score = 100.0 - (depth * 15.0)
+    """Prioritizes content paths (articles, docs, products) over administrative links."""
+    score = 100.0 - (depth * 2.0)
     valuable_keywords = ["/product/", "/article/", "/doc/", "/data/", "/item/", "/blog/", "/news/", "/case-studies/", "/solutions/"]
     if any(k in url.lower() for k in valuable_keywords):
-        score += 35.0
+        score += 30.0
     utility_keywords = ["/tag/", "/page/", "/category/", "/search/", "/login", "/terms", "/privacy"]
     if any(k in url.lower() for k in utility_keywords):
         score -= 20.0
@@ -97,34 +99,102 @@ def calculate_url_priority(url: str, depth: int) -> float:
 
 
 def get_root_domain(netloc: str) -> str:
-    """Extracts apex root domain (e.g. 'nvidia.com' from 'www.nvidia.com')."""
+    """Extracts apex root domain (e.g. 'nvidia.com' from 'www.nvidia.com' or 'blogs.nvidia.com')."""
     parts = netloc.lower().split(".")
     if len(parts) >= 2:
         return ".".join(parts[-2:])
     return netloc.lower()
 
 
+def sanitize_url(raw_url: str) -> str:
+    """Strips tracking query parameters (utm_*, gclid, etc.) and anchor fragments."""
+    parsed = urlparse(raw_url)
+    clean_path = parsed.path.rstrip("/")
+    if not clean_path:
+        clean_path = ""
+    
+    # Strip tracking parameters
+    if parsed.query:
+        qs = parse_qs(parsed.query)
+        tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref", "source", "session_id"}
+        filtered_qs = {k: v for k, v in qs.items() if k.lower() not in tracking_keys}
+        clean_query = urlencode(filtered_qs, doseq=True) if filtered_qs else ""
+    else:
+        clean_query = ""
+
+    clean_url = urlunparse((parsed.scheme, parsed.netloc, clean_path, "", clean_query, ""))
+    return clean_url
+
+
 def normalize_target_url(raw_url: str, base_domain: str, current_url: str) -> str | None:
-    """Normalizes URLs and enforces apex root domain boundaries (allowing blogs.*, news.*, docs.*)."""
+    """Normalizes URLs and enforces apex root domain boundaries across the entire site."""
     if not raw_url or raw_url.startswith(("#", "javascript:", "mailto:", "tel:")):
         return None
-    full_url = urljoin(current_url, raw_url).split("#")[0].rstrip("/")
-    parsed = urlparse(full_url)
     
+    full_url = urljoin(current_url, raw_url).split("#")[0]
+    full_url = sanitize_url(full_url)
+    
+    parsed = urlparse(full_url)
     root_base = get_root_domain(base_domain)
     target_netloc = parsed.netloc.lower()
     
-    if (target_netloc == base_domain or target_netloc.endswith("." + root_base) or target_netloc == root_base) and parsed.scheme in ("http", "https"):
-        if not full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe")):
+    if (target_netloc == base_domain.lower() or target_netloc.endswith("." + root_base) or target_netloc == root_base) and parsed.scheme in ("http", "https"):
+        # Ignore binary files and media
+        if not full_url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".pdf", ".zip", ".tar", ".mp4", ".exe", ".iso", ".dmg")):
             return full_url
     return None
+
+
+# -----------------------------------------------------------------------------
+# SITEMAP DISCOVERY HELPER
+# -----------------------------------------------------------------------------
+async def discover_sitemap_urls(session: "CffiAsyncSession", seed_url: str, base_domain: str) -> set[str]:
+    """Attempts to discover all indexed URLs from sitemap.xml and robots.txt."""
+    discovered = set()
+    root_base = get_root_domain(base_domain)
+    parsed = urlparse(seed_url)
+    base_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    candidate_sitemaps = [
+        f"{base_origin}/sitemap.xml",
+        f"{base_origin}/sitemap_index.xml",
+        f"{base_origin}/robots.txt"
+    ]
+
+    for s_url in candidate_sitemaps:
+        try:
+            resp = await session.get(s_url, timeout=10)
+            if resp.status_code == 200:
+                if s_url.endswith(".txt"):
+                    for line in resp.text.splitlines():
+                        if line.lower().startswith("sitemap:"):
+                            s_target = line.split(":", 1)[1].strip()
+                            candidate_sitemaps.append(s_target)
+                elif "<urlset" in resp.text or "<sitemapindex" in resp.text:
+                    try:
+                        # Extract <loc> tags
+                        locs = re.findall(r"<loc>(.*?)</loc>", resp.text, re.IGNORECASE)
+                        for loc in locs:
+                            loc = loc.strip()
+                            if loc.endswith(".xml"):
+                                candidate_sitemaps.append(loc)
+                            else:
+                                clean_loc = normalize_target_url(loc, base_domain, seed_url)
+                                if clean_loc:
+                                    discovered.add(clean_loc)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    return discovered
 
 
 # -----------------------------------------------------------------------------
 # MULTI-MODAL CONTENT EXTRACTOR
 # -----------------------------------------------------------------------------
 def extract_editorial_markdown(html_content: str, url: str) -> str:
-    """Extracts complete clean editorial copy, preserving all page sections and formatting card text properly."""
+    """Extracts complete clean editorial copy, unwrapping card link blocks and removing UI clutter."""
     soup = BeautifulSoup(html_content, "html.parser")
 
     # 1. Unpack block-level <a> tags (cards) so headlines and paragraphs don't get wrapped in giant [Title Body](url) brackets
@@ -138,7 +208,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
     for el in soup.find_all(["script", "style", "noscript", "svg", "iframe", "button", "form", "nav", "header", "footer"]):
         el.decompose()
 
-    # 3. Remove carousel indicator dots, country modals, and cookie banners
+    # 3. Remove noise widgets (carousels, country selectors, cookie notices)
     noise_matchers = [
         "cmp-carousel__indicators", "cmp-carousel__actions", "carousel-indicators", "carousel-control",
         "slider-nav", "slider-pagination", "slick-dots", "cookie", "modal", "drawer",
@@ -151,7 +221,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
     for a in soup.find_all("a", href=True):
         a["href"] = urljoin(url, a["href"])
 
-    # 5. Extract Markdown
+    # 5. Convert to clean Markdown
     body = soup.find("body") or soup
     dom_md = markdownify.markdownify(
         str(body),
@@ -160,7 +230,7 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
         strip=["script", "style", "button", "form", "nav", "svg", "img", "noscript", "iframe"]
     )
 
-    # 6. Clean UI noise phrases
+    # 6. Clean common UI noise patterns
     ui_noise = [
         r"Accordion is (?:closed|open)[^\n.]*\.",
         r"Click to (?:expand|collapse)[^\n.]*\.",
@@ -198,71 +268,31 @@ def extract_editorial_markdown(html_content: str, url: str) -> str:
 
 
 def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> dict:
+    """Extracts text, Markdown, data tables, images, metadata, JSON-LD, emails, code, and internal links."""
     soup = BeautifulSoup(html_content, "html.parser")
-    page_title = soup.find("title").get_text(strip=True) if soup.find("title") else "Untitled"
 
-    # 1. Clean Markdown Text (Trafilatura + DOM Hybrid)
-    markdown_content = extract_editorial_markdown(html_content, url)
+    # Title extraction
+    title_tag = soup.find("title")
+    h1_tag = soup.find("h1")
+    page_title = title_tag.get_text().strip() if title_tag else (h1_tag.get_text().strip() if h1_tag else "Untitled Page")
 
-    # 2. Extract HTML Data Tables and Definition Lists into DataFrames
-    extracted_tables = []
-    for idx, tbl in enumerate(soup.find_all("table"), start=1):
-        try:
-            df_list = pd.read_html(str(tbl))
-            if df_list and not df_list[0].empty:
-                df = df_list[0]
-                extracted_tables.append({
-                    "id": f"Table #{idx}",
-                    "rows": len(df),
-                    "columns": len(df.columns),
-                    "dataframe": df
-                })
-        except Exception:
-            pass
-
-    for d_idx, dl in enumerate(soup.find_all("dl"), start=1):
-        dts = [dt.get_text(strip=True) for dt in dl.find_all("dt")]
-        dds = [dd.get_text(strip=True) for dd in dl.find_all("dd")]
-        if dts and len(dts) == len(dds):
-            df_dl = pd.DataFrame({"Key": dts, "Value": dds})
-            extracted_tables.append({
-                "id": f"Key-Value List #{d_idx}",
-                "rows": len(df_dl),
-                "columns": 2,
-                "dataframe": df_dl
-            })
-
-    # 3. High-Quality Media Assets (Exclude 1x1 pixels, base64, and SVGs)
-    images = []
-    seen_imgs = set()
-    for img in soup.find_all("img", src=True):
-        src = img["src"].strip()
-        full_src = urljoin(url, src)
-        if full_src.startswith(("http://", "https://")) and full_src not in seen_imgs:
-            if not any(noise in full_src.lower() for noise in ["pixel.gif", "spacer.gif", "blank.gif", "1x1"]):
-                seen_imgs.add(full_src)
-                images.append({
-                    "src": full_src,
-                    "alt": img.get("alt", "").strip() or "Image Asset"
-                })
-
-    # 4. SEO, OpenGraph & JSON-LD Schemas
+    # Metadata & JSON-LD Schemas
     meta_info = {
         "title": page_title,
         "description": "",
+        "canonical": "",
         "og_title": "",
         "og_description": "",
         "og_image": "",
-        "canonical": "",
         "json_ld_schemas": []
     }
-    for m in soup.find_all("meta"):
-        name = m.get("name", "").lower()
-        prop = m.get("property", "").lower()
-        content = m.get("content", "").strip()
-        if not content:
-            continue
-        if name == "description" or prop == "description":
+
+    for meta in soup.find_all("meta"):
+        name = meta.get("name", "").lower()
+        prop = meta.get("property", "").lower()
+        content = meta.get("content", "")
+
+        if name == "description":
             meta_info["description"] = content
         elif prop == "og:title":
             meta_info["og_title"] = content
@@ -271,37 +301,75 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
         elif prop == "og:image":
             meta_info["og_image"] = urljoin(url, content)
 
-    can = soup.find("link", rel="canonical")
-    if can and can.get("href"):
-        meta_info["canonical"] = urljoin(url, can["href"])
+    canon = soup.find("link", rel="canonical")
+    if canon and canon.get("href"):
+        meta_info["canonical"] = urljoin(url, canon["href"])
 
-    for s_tag in soup.find_all("script", type="application/ld+json"):
+    for s in soup.find_all("script", type="application/ld+json"):
         try:
-            if s_tag.string:
-                parsed_schema = json.loads(s_tag.string.strip())
+            if s.string:
+                parsed_schema = json.loads(s.string.strip())
                 meta_info["json_ld_schemas"].append(parsed_schema)
         except Exception:
             pass
 
-    # 5. Outlinks Discovery
+    # Clean editorial copy
+    markdown_content = extract_editorial_markdown(html_content, url)
+
+    # Tables extraction
+    extracted_tables = []
+    for i, table in enumerate(soup.find_all("table")):
+        try:
+            dfs = pd.read_html(str(table))
+            if dfs and not dfs[0].empty:
+                df = dfs[0]
+                if df.shape[0] >= 1 and df.shape[1] >= 1:
+                    extracted_tables.append({
+                        "id": f"Table #{i+1}",
+                        "rows": len(df),
+                        "columns": len(df.columns),
+                        "dataframe": df
+                    })
+        except Exception:
+            pass
+
+    # Images extraction
+    images = []
+    seen_img_urls = set()
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("srcset", "").split()[0] if img.get("srcset") else None
+        if src and not src.startswith("data:"):
+            abs_src = urljoin(url, src)
+            if abs_src not in seen_img_urls:
+                seen_img_urls.add(abs_src)
+                images.append({
+                    "src": abs_src,
+                    "alt": img.get("alt", "").strip() or "Image Asset",
+                    "width": img.get("width", ""),
+                    "height": img.get("height", "")
+                })
+
+    # Internal links discovery (including root-domain subdomains)
     outlinks = []
+    seen_links = set()
     for a in soup.find_all("a", href=True):
-        norm = normalize_target_url(a["href"], base_domain, url)
-        if norm and norm not in outlinks:
-            outlinks.append(norm)
+        norm_url = normalize_target_url(a["href"], base_domain, url)
+        if norm_url and norm_url not in seen_links:
+            seen_links.add(norm_url)
+            outlinks.append(norm_url)
 
-    # 6. Contact Emails
-    emails = list(set(re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content)))
-    clean_emails = [e for e in emails if not e.endswith(('.png', '.jpg', '.webp', '.js', '.svg', '.css'))]
+    # Emails extraction
+    emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html_content)
+    clean_emails = list(set([e for e in emails if not e.endswith((".png", ".jpg", ".js", ".css"))]))
 
-    # 7. Code Snippets
+    # Code snippets
     code_snippets = []
     for pre in soup.find_all(["pre", "code"]):
         c_txt = pre.get_text().strip()
         if len(c_txt) > 20 and "\n" in c_txt and c_txt not in code_snippets:
             code_snippets.append(c_txt)
 
-    # Metrics
+    # Word count and reading time
     word_count = len(re.findall(r"\w+", markdown_content))
     reading_time = max(1, round(word_count / 220))
 
@@ -322,76 +390,26 @@ def extract_multimodal_data(html_content: str, url: str, base_domain: str) -> di
 
 
 # -----------------------------------------------------------------------------
-# HIGH-CONCURRENCY ASYNC CRAWLER ENGINES
+# UNBOUNDED FULL-SITE ASYNC CRAWLER ENGINE (NO DEPTH & NO PAGE LIMITS)
 # -----------------------------------------------------------------------------
-async def crawl_with_crawl4ai(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text) -> list[dict]:
+async def crawl_entire_domain_unbounded(
+    seed_url: str,
+    status_placeholder,
+    metric_cols,
+    concurrency: int = 8
+) -> list[dict]:
+    """
+    Crawls every single page across the entire domain with NO depth limit and NO page limit.
+    Continuously updates live metrics in Streamlit and exhausts the full domain frontier.
+    """
     parsed = urlparse(seed_url)
     base_domain = parsed.netloc
-
-    browser_config = BrowserConfig(
-        headless=True,
-        browser_type="chromium",
-        extra_args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
-    )
-
-    crawler_run_config = CrawlerRunConfig(
-        session_id="adaptive_enterprise_session",
-        cache_mode=CacheMode.BYPASS,
-        wait_until="domcontentloaded",
-        page_timeout=30000,
-        remove_overlay_elements=True,
-        word_count_threshold=5,
-        js_code="window.scrollTo(0, document.body.scrollHeight/2);"
-    )
+    sanitized_seed = sanitize_url(seed_url)
 
     frontier: list[FrontierItem] = []
-    visited = set([seed_url])
-    results = []
-
-    heapq.heappush(frontier, FrontierItem(100.0, seed_url, 0))
-
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        while frontier and len(results) < max_pages:
-            item = heapq.heappop(frontier)
-            if status_text:
-                status_text.text(f"⚡ [Crawl4AI Page {len(results)+1}/{max_pages}] Fetching: {item.url[:65]}...")
-
-            start_t = time.time()
-            try:
-                res = await crawler.arun(url=item.url, config=crawler_run_config)
-                duration = round(time.time() - start_t, 2)
-
-                if res.success:
-                    page_data = extract_multimodal_data(res.html or "", item.url, base_domain)
-                    page_data["status"] = "SUCCESS"
-                    page_data["fetch_time_sec"] = duration
-                    page_data["depth"] = item.depth
-                    results.append(page_data)
-
-                    if item.depth < max_depth:
-                        for link in page_data["links"]:
-                            if link not in visited:
-                                visited.add(link)
-                                score = calculate_url_priority(link, item.depth + 1)
-                                heapq.heappush(frontier, FrontierItem(score, link, item.depth + 1))
-            except Exception:
-                pass
-
-            if progress_bar:
-                progress_bar.progress(min(1.0, len(results) / max_pages))
-
-    return results
-
-
-async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_depth: int, progress_bar, status_text, concurrency: int = 6) -> list[dict]:
-    parsed = urlparse(seed_url)
-    base_domain = parsed.netloc
-
-    frontier: list[FrontierItem] = []
-    visited = set([seed_url])
-    results = []
-
-    heapq.heappush(frontier, FrontierItem(100.0, seed_url, 0))
+    visited: set[str] = set([sanitized_seed])
+    results: list[dict] = []
+    heapq.heappush(frontier, FrontierItem(100.0, sanitized_seed, 0))
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -399,21 +417,35 @@ async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_dep
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+    start_time = time.time()
+
     async with CffiAsyncSession(impersonate="chrome124", headers=headers, timeout=25) as session:
-        while frontier and len(results) < max_pages:
-            batch = []
-            while frontier and len(batch) < concurrency and (len(results) + len(batch)) < max_pages:
+        # Step 1: Discover sitemap URLs to preload all known site URLs into the frontier
+        if status_placeholder:
+            status_placeholder.markdown("🔍 **Step 1/2:** Discovering full site structure via `sitemap.xml` & `robots.txt`...")
+
+        sitemap_urls = await discover_sitemap_urls(session, sanitized_seed, base_domain)
+        for s_url in sitemap_urls:
+            if s_url not in visited:
+                visited.add(s_url)
+                heapq.heappush(frontier, FrontierItem(90.0, s_url, 1))
+
+        if status_placeholder:
+            status_placeholder.markdown(f"🚀 **Step 2/2:** Crawling all discovered pages across `{base_domain}` (No depth/page limits)...")
+
+        # Step 2: Unbounded Concurrent Crawl Loop
+        while frontier:
+            # Prepare concurrent batch
+            batch: list[FrontierItem] = []
+            while frontier and len(batch) < concurrency:
                 batch.append(heapq.heappop(frontier))
 
-            if status_text:
-                status_text.text(f"🚀 [Fast Engine Batch] Crawled {len(results)}/{max_pages} pages ({len(frontier)} queued in frontier)...")
-
-            async def fetch_item(item):
+            async def fetch_page(item: FrontierItem):
                 t0 = time.time()
                 try:
                     resp = await session.get(item.url)
                     dur = round(time.time() - t0, 2)
-                    if resp.status_code == 200:
+                    if resp.status_code == 200 and "text/html" in resp.headers.get("content-type", "").lower():
                         data = extract_multimodal_data(resp.text, item.url, base_domain)
                         data["status"] = "SUCCESS"
                         data["fetch_time_sec"] = dur
@@ -423,20 +455,37 @@ async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_dep
                     pass
                 return None, item.depth
 
-            batch_results = await asyncio.gather(*[fetch_item(it) for it in batch])
+            batch_results = await asyncio.gather(*[fetch_page(it) for it in batch])
 
             for res_data, depth in batch_results:
                 if res_data:
                     results.append(res_data)
-                    if depth < max_depth:
-                        for link in res_data["links"]:
-                            if link not in visited:
-                                visited.add(link)
-                                score = calculate_url_priority(link, depth + 1)
-                                heapq.heappush(frontier, FrontierItem(score, link, depth + 1))
+                    # Enqueue all newly discovered internal links without any depth boundary
+                    for link in res_data["links"]:
+                        if link not in visited:
+                            visited.add(link)
+                            score = calculate_url_priority(link, depth + 1)
+                            heapq.heappush(frontier, FrontierItem(score, link, depth + 1))
 
-            if progress_bar:
-                progress_bar.progress(min(1.0, len(results) / max_pages))
+            # Update live Streamlit counters
+            elapsed = max(0.1, round(time.time() - start_time, 1))
+            speed = round(len(results) / elapsed, 1)
+            total_words = sum(p["word_count"] for p in results)
+
+            if metric_cols:
+                with metric_cols[0]:
+                    st.metric("Pages Extracted", len(results))
+                with metric_cols[1]:
+                    st.metric("In Frontier Queue", len(frontier))
+                with metric_cols[2]:
+                    st.metric("Words Extracted", f"{total_words:,}")
+                with metric_cols[3]:
+                    st.metric("Speed (pages/sec)", f"{speed} p/s")
+
+            if status_placeholder:
+                status_placeholder.markdown(
+                    f"⚡ **Crawling Domain:** `{len(results)}` pages completed | `{len(frontier)}` remaining in queue | `{elapsed}s` elapsed..."
+                )
 
     return results
 
@@ -445,93 +494,49 @@ async def crawl_with_curl_cffi_concurrent(seed_url: str, max_pages: int, max_dep
 # MAIN STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.markdown('<div class="main-header">⚡ Enterprise Full-Site Crawler & Data Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Crawl4AI Dynamic Execution + High-Concurrency Priority Frontier Full-Domain Deep Extraction.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Unlimited Full-Domain Deep Crawler — Extracts 100% of pages, internal links, schemas, and content across the entire website.</div>', unsafe_allow_html=True)
 
-# Engine Status Banner
-if CRAWL4AI_AVAILABLE and TRAFILATURA_AVAILABLE:
-    st.success("✅ **Crawl4AI Dynamic Engine Active** (Full JS Execution + Multi-Page Priority Frontier)")
-elif CRAWL4AI_AVAILABLE:
-    st.success("✅ **Crawl4AI Dynamic Engine Ready** (Playwright Browser + DOM Parser)")
+# Status banner
+if CURL_CFFI_AVAILABLE:
+    st.success("✅ **High-Concurrency Unlimited Full-Domain Engine Active** (Chrome124 Stealth TLS + Unlimited Frontier Traversal + Sitemap Preloader)")
 else:
-    st.info("⚡ **High-Speed Stealth TLS Engine Ready** (`curl_cffi` Chrome124 Fingerprint).")
+    st.info("⚡ Standard Engine Ready.")
 
-col1, col2, col3, col4 = st.columns([4, 2, 2, 2])
-with col1:
+col_url, col_btn = st.columns([4, 1.2])
+with col_url:
     target_url = st.text_input(
-        "Target URL",
+        "Target Website URL",
         value="https://quotes.toscrape.com/js/",
         placeholder="https://example.com",
         label_visibility="collapsed"
     )
-with col2:
-    crawl_limit = st.selectbox(
-        "Pages to Crawl",
-        options=[1, 5, 15, 50, 100, 250],
-        index=2,
-        format_func=lambda x: f"📑 Crawl {x} Pages{' (Section)' if x == 15 else ' (Deep)' if x >= 50 else ''}",
-        label_visibility="collapsed"
-    )
-with col3:
-    crawl_depth = st.selectbox(
-        "Crawl Depth",
-        options=[1, 2, 3, 5],
-        index=2,
-        format_func=lambda d: f"🌲 Depth {d} ({'Seed Only' if d == 1 else 'Direct Links' if d == 2 else 'Deep Recursive'})",
-        label_visibility="collapsed"
-    )
-with col4:
-    start_btn = st.button("🚀 Start Crawl", type="primary", use_container_width=True)
+with col_btn:
+    start_btn = st.button("🚀 Crawl Entire Website", type="primary", use_container_width=True)
 
+# Live crawling execution container
 if start_btn and target_url:
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
-    progress = st.progress(0.0)
-    status = st.empty()
-    status.text("Initializing multi-page crawler session...")
+    status_box = st.empty()
+    live_metrics = st.columns(4)
 
     start_total_t = time.time()
-    crawled_data = []
 
-    if CRAWL4AI_AVAILABLE and crawl_limit <= 15:
-        try:
-            crawled_data = asyncio.run(
-                crawl_with_crawl4ai(
-                    seed_url=target_url,
-                    max_pages=crawl_limit,
-                    max_depth=crawl_depth,
-                    progress_bar=progress,
-                    status_text=status
-                )
-            )
-        except Exception:
-            status.text("⚡ Fallback: Executing via High-Speed Concurrent TLS Engine...")
-            crawled_data = asyncio.run(
-                crawl_with_curl_cffi_concurrent(
-                    seed_url=target_url,
-                    max_pages=crawl_limit,
-                    max_depth=crawl_depth,
-                    progress_bar=progress,
-                    status_text=status,
-                    concurrency=5
-                )
-            )
-    else:
-        crawled_data = asyncio.run(
-            crawl_with_curl_cffi_concurrent(
-                seed_url=target_url,
-                max_pages=crawl_limit,
-                max_depth=crawl_depth,
-                progress_bar=progress,
-                status_text=status,
-                concurrency=6
-            )
+    crawled_data = asyncio.run(
+        crawl_entire_domain_unbounded(
+            seed_url=target_url,
+            status_placeholder=status_box,
+            metric_cols=live_metrics,
+            concurrency=8
         )
+    )
 
     total_duration = round(time.time() - start_total_t, 2)
     speed = round(len(crawled_data) / max(0.1, total_duration), 1)
-    status.text(f"✅ Extracted {len(crawled_data)} full pages in {total_duration}s ({speed} pages/sec)")
+    status_box.success(f"🎉 **Full Site Crawl Completed:** Extracted all {len(crawled_data)} pages across the domain in {total_duration}s ({speed} pages/sec)!")
     st.session_state["crawled_data"] = crawled_data
+
 
 # Display Results from Session State
 if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
@@ -559,7 +564,7 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
     st.markdown("---")
 
     # Interactive Table of All Crawled Pages
-    st.markdown("### 📋 Crawled Pages Index")
+    st.markdown("### 📋 Complete Crawled Pages Index")
     summary_df = pd.DataFrame([
         {
             "Page #": i + 1,
@@ -579,13 +584,13 @@ if "crawled_data" in st.session_state and st.session_state["crawled_data"]:
     # Export & Search Bar
     exp_col1, exp_col2 = st.columns([4, 1])
     with exp_col1:
-        search_query = st.text_input("🔍 Search across all crawled pages:", placeholder="Filter by keyword (e.g. quantum, blackwell, pricing, safety)...", label_visibility="collapsed")
+        search_query = st.text_input("🔍 Search across all crawled pages:", placeholder="Filter by keyword (e.g. quotes, Einstein, safety, pricing)...", label_visibility="collapsed")
     with exp_col2:
         export_payload = json.dumps([{k: v for k, v in p.items() if k != "tables"} for p in crawled_data], indent=2)
         st.download_button(
-            "📦 Export Dataset (JSON)",
+            "📦 Export Entire Dataset (JSON)",
             data=export_payload,
-            file_name="full_site_crawl_dataset.json",
+            file_name="complete_full_site_crawl.json",
             mime="application/json",
             use_container_width=True
         )
