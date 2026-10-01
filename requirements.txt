@@ -1,10 +1,9 @@
-# Crawlee PlaywrightCrawler Dependencies
 crawlee[playwright]>=1.10.0
 playwright>=1.40.0
 streamlit>=1.35.0
 beautifulsoup4>=4.12.0
-markdownify>=1.2.0
-pandas>=2.0.0
+markdownify>=0.12.0
+pandas>=2.1.0
 openpyxl>=3.1.0
-pydantic>=2.0.0
-defusedxml>=0.7.0
+pydantic>=2.5.0
+defusedxml>=0.7.1
