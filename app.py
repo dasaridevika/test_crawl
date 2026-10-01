@@ -43,6 +43,8 @@ if "crawl_stats" not in st.session_state:
     st.session_state["crawl_stats"] = {}
 if "is_crawling" not in st.session_state:
     st.session_state["is_crawling"] = False
+if "crawl_error" not in st.session_state:
+    st.session_state["crawl_error"] = None
 
 # -----------------------------------------------------------------------------
 # TOP HEADER & SIMPLE INPUT
@@ -88,6 +90,7 @@ if extract_clicked:
             st.session_state["is_crawling"] = True
             st.session_state["crawl_results"] = []
             st.session_state["crawl_stats"] = {}
+            st.session_state["crawl_error"] = None
 
             progress_bar = st.progress(0.0)
             status_text = st.empty()
@@ -134,7 +137,7 @@ if extract_clicked:
                 progress_bar.progress(1.0)
                 status_text.empty()
             except Exception as e:
-                st.error(f"Extraction error: {str(e)}")
+                st.session_state["crawl_error"] = str(e)
             finally:
                 st.session_state["is_crawling"] = False
                 st.rerun()
@@ -142,6 +145,9 @@ if extract_clicked:
 # -----------------------------------------------------------------------------
 # RESULTS DISPLAY
 # -----------------------------------------------------------------------------
+if st.session_state.get("crawl_error"):
+    st.error(f"Extraction Error: {st.session_state['crawl_error']}")
+
 results: List[Dict[str, Any]] = st.session_state.get("crawl_results", [])
 stats: Dict[str, Any] = st.session_state.get("crawl_stats", {})
 

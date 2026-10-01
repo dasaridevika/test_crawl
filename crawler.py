@@ -527,6 +527,71 @@ class CrawlConfig:
 
 
 # -----------------------------------------------------------------------------
+# PLAYWRIGHT BINARY ENSURER & RESILIENT HTTP FALLBACK
+# -----------------------------------------------------------------------------
+_PLAYWRIGHT_CHECKED = False
+
+def ensure_playwright_browsers():
+    """Ensure Chromium browser binaries are installed for Playwright in headless/cloud environments."""
+    global _PLAYWRIGHT_CHECKED
+    if _PLAYWRIGHT_CHECKED:
+        return
+    _PLAYWRIGHT_CHECKED = True
+    try:
+        # Non-blocking attempt to install playwright chromium if needed
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=45
+        )
+    except Exception as e:
+        logger.debug(f"Playwright install check note: {e}")
+
+
+def fetch_html_fallback(url: str, user_agent: str = USER_AGENT, timeout: int = 15) -> Tuple[int, str, str]:
+    """Resilient HTTP fetcher fallback with gzip/deflate support and standard browser headers."""
+    import ssl
+    import zlib
+    import urllib.error
+    
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive"
+    }
+    req = URLRequest(url, headers=headers)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        with urlopen(req, timeout=timeout, context=ctx) as response:
+            status_code = response.getcode()
+            final_url = response.geturl()
+            raw_data = response.read()
+            encoding = response.info().get("Content-Encoding", "").lower()
+            if "gzip" in encoding:
+                raw_data = gzip.decompress(raw_data)
+            elif "deflate" in encoding:
+                try:
+                    raw_data = zlib.decompress(raw_data)
+                except Exception:
+                    raw_data = zlib.decompress(raw_data, -zlib.MAX_WBITS)
+
+            charset = response.headers.get_content_charset() or "utf-8"
+            html_text = raw_data.decode(charset, errors="replace")
+            return status_code, html_text, final_url
+    except urllib.error.HTTPError as e:
+        return e.code, "", url
+    except Exception as e:
+        logger.warning(f"HTTP fallback error on {url}: {e}")
+        return 0, "", url
+
+
+# -----------------------------------------------------------------------------
 # CRAWLEE PLAYWRIGHT CRAWLER ENGINE
 # -----------------------------------------------------------------------------
 class CrawleeWebCrawler:
@@ -553,6 +618,7 @@ class CrawleeWebCrawler:
     async def crawl(self, on_page_crawled: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None) -> List[Dict[str, Any]]:
         start_time = time.perf_counter()
         logger.info(f"Starting Crawl on {self.config.seed_url} (max_pages={self.config.max_pages}, max_depth={self.config.max_depth})")
+        ensure_playwright_browsers()
 
         # 1. Security check
         safe, reason = is_safe_url(self.config.seed_url)
@@ -757,11 +823,67 @@ class CrawleeWebCrawler:
             current_url = getattr(req, "url", "") or "Unknown URL"
             user_data = getattr(req, "user_data", {}) or {}
             depth = user_data.get("depth", 0)
+
+            # Resilient HTTP fallback before giving up
+            fb_status, fb_html, final_url = fetch_html_fallback(current_url, self.config.user_agent, timeout=self.config.timeout)
+            if fb_html and fb_status < 400:
+                t0 = time.perf_counter()
+                extracted = extract_exact_content(fb_html, final_url)
+                is_blocked, marker = detect_access_challenge(fb_status, fb_html)
+                status = "BLOCKED" if is_blocked else "SUCCESS"
+
+                rec = {
+                    "url": current_url,
+                    "final_url": final_url,
+                    "status": status,
+                    "http_status": fb_status,
+                    "title": extracted["title"],
+                    "meta_description": extracted["meta_description"],
+                    "word_count": extracted["word_count"],
+                    "character_count": extracted["character_count"],
+                    "markdown": extracted["markdown"],
+                    "plain_text": extracted["plain_text"],
+                    "rendered_html": fb_html,
+                    "error": {"code": "access_challenge", "message": marker} if is_blocked else None,
+                    "depth": depth,
+                    "fetch_time_ms": round((time.perf_counter() - t0) * 1000.0, 2)
+                }
+                self.stats["attempted"] += 1
+                if status == "SUCCESS":
+                    self.stats["successful"] += 1
+                    self.stats["total_words"] += extracted["word_count"]
+                    self.stats["total_bytes"] += len(fb_html.encode("utf-8"))
+                else:
+                    self.stats["blocked"] += 1
+
+                self.results.append(rec)
+
+                # Link discovery for HTTP fallback
+                if depth < self.config.max_depth and status == "SUCCESS":
+                    soup = BeautifulSoup(fb_html, "html.parser")
+                    for a in soup.find_all("a", href=True):
+                        raw_href = a["href"].strip()
+                        norm = normalize_url(raw_href, final_url)
+                        if norm and norm not in self.seen_urls:
+                            if is_in_scope(norm, self.config.seed_url, self.config.allow_subdomains):
+                                safe_l, _ = is_safe_url(norm)
+                                if safe_l:
+                                    self.seen_urls.add(norm)
+                                    await request_queue.add_request(Request.from_url(norm, user_data={"depth": depth + 1}))
+
+                self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+                if on_page_crawled:
+                    try:
+                        on_page_crawled(rec, self.stats)
+                    except Exception:
+                        pass
+                return
+
             self.stats["attempted"] += 1
             self.stats["failed"] += 1
 
             resp = getattr(context, "response", None)
-            http_status = getattr(resp, "status", None)
+            http_status = getattr(resp, "status", None) or (fb_status if fb_status > 0 else None)
 
             rec = {
                 "url": current_url,
@@ -780,6 +902,7 @@ class CrawleeWebCrawler:
                 "fetch_time_ms": 0.0
             }
             self.results.append(rec)
+            self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
             if on_page_crawled:
                 try:
                     on_page_crawled(rec, self.stats)
