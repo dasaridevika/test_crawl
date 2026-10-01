@@ -134,7 +134,6 @@ def is_safe_url(url: str) -> Tuple[bool, Optional[str]]:
                     or ip.is_private
                     or ip.is_link_local
                     or ip.is_multicast
-                    or ip.is_reserved
                     or ip.is_unspecified
                 ):
                     return False, f"Resolved to disallowed IP: {ip_str}"
