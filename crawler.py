@@ -1151,8 +1151,9 @@ class CrawleePlaywrightCrawlerEngine:
         @crawler.router.default_handler
         async def request_handler(context: PlaywrightCrawlingContext) -> None:
             nonlocal total_latency
-            current_url = context.request.url
-            depth = context.request.user_data.get("depth", 0)
+            current_url = getattr(getattr(context, "request", None), "url", "")
+            user_data = getattr(getattr(context, "request", None), "user_data", {}) or {}
+            depth = user_data.get("depth", 0)
             self.stats["attempted"] += 1
 
             # Rate Limit Delay
@@ -1188,7 +1189,18 @@ class CrawleePlaywrightCrawlerEngine:
                     "links": [],
                     "tables": [],
                     "json_ld": [],
-                    "quality": {},
+                    "quality": {
+                        "word_count": 0,
+                        "character_count": 0,
+                        "headings_count": 0,
+                        "sections_count": 0,
+                        "cards_count": 0,
+                        "images_count": 0,
+                        "links_count": 0,
+                        "tables_count": 0,
+                        "duplicate_blocks_count": 0,
+                        "duplicate_blocks": []
+                    },
                     "warnings": ["disallowed_by_robots_txt"],
                     "error": None,
                     "depth": depth,
@@ -1198,30 +1210,41 @@ class CrawleePlaywrightCrawlerEngine:
                 }
                 self.results.append(rec)
                 if on_page_crawled:
-                    on_page_crawled(rec, self.stats)
+                    try:
+                        on_page_crawled(rec, self.stats)
+                    except Exception as cb_err:
+                        logger.debug(f"on_page_crawled callback error: {cb_err}")
                 return
 
             t0 = time.perf_counter()
-            page = context.page
+            page = getattr(context, "page", None)
 
-            # Wait for DOM ready & trigger lazy loading
-            try:
-                await page.wait_for_load_state("domcontentloaded")
-                await page.evaluate("""async () => {
-                    window.scrollTo(0, document.body.scrollHeight / 2);
-                    await new Promise(r => setTimeout(r, 200));
-                    window.scrollTo(0, document.body.scrollHeight);
-                    await new Promise(r => setTimeout(r, 200));
-                    window.scrollTo(0, 0);
-                }""")
-            except Exception:
-                pass
+            rendered_html = ""
+            final_url = current_url
+            if page:
+                # Wait for DOM ready & trigger lazy loading
+                try:
+                    await page.wait_for_load_state("domcontentloaded")
+                    await page.evaluate("""async () => {
+                        window.scrollTo(0, document.body.scrollHeight / 2);
+                        await new Promise(r => setTimeout(r, 200));
+                        window.scrollTo(0, document.body.scrollHeight);
+                        await new Promise(r => setTimeout(r, 200));
+                        window.scrollTo(0, 0);
+                    }""")
+                except Exception:
+                    pass
 
-            rendered_html = await page.content()
-            final_url = page.url or current_url
-            http_status = context.response.status if context.response else 200
-            resp_headers = context.response.headers if context.response else {}
-            content_type = resp_headers.get("content-type", "text/html")
+                try:
+                    rendered_html = await page.content()
+                    final_url = page.url or current_url
+                except Exception:
+                    rendered_html = ""
+
+            resp = getattr(context, "response", None)
+            http_status = getattr(resp, "status", None) or 200
+            resp_headers = getattr(resp, "headers", None) or {}
+            content_type = resp_headers.get("content-type", "text/html") if isinstance(resp_headers, dict) else "text/html"
 
             fetch_time_ms = (time.perf_counter() - t0) * 1000.0
             total_latency += fetch_time_ms
@@ -1273,57 +1296,85 @@ class CrawleePlaywrightCrawlerEngine:
 
             self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
             self.stats["avg_latency_ms"] = round(total_latency / max(1, self.stats["attempted"]), 2)
-            self.stats["pages_in_frontier"] = await request_queue.get_total_count() - await request_queue.get_handled_count()
+            try:
+                self.stats["pages_in_frontier"] = await request_queue.get_total_count() - await request_queue.get_handled_count()
+            except Exception:
+                self.stats["pages_in_frontier"] = 0
 
             if on_page_crawled:
-                on_page_crawled(record, self.stats)
+                try:
+                    on_page_crawled(record, self.stats)
+                except Exception as cb_err:
+                    logger.debug(f"on_page_crawled callback error: {cb_err}")
 
         @crawler.failed_request_handler
         async def failed_request_handler(context: PlaywrightCrawlingContext, error: Exception) -> None:
-            nonlocal total_latency
-            current_url = context.request.url
-            depth = context.request.user_data.get("depth", 0)
-            self.stats["attempted"] += 1
-            self.stats["failed"] += 1
+            try:
+                nonlocal total_latency
+                req = getattr(context, "request", None)
+                current_url = getattr(req, "url", "") or "Unknown URL"
+                user_data = getattr(req, "user_data", {}) or {}
+                depth = user_data.get("depth", 0)
+                self.stats["attempted"] += 1
+                self.stats["failed"] += 1
 
-            logger.warning(f"Crawlee failed request for {current_url}: {error}")
-            rec = {
-                "url": current_url,
-                "final_url": None,
-                "status": "ERROR",
-                "http_status": context.response.status if context.response else None,
-                "crawl_method": "crawlee_playwright",
-                "rendered": False,
-                "content_complete": False,
-                "raw_html": "",
-                "rendered_html": "",
-                "cleaned_html": "",
-                "markdown": "",
-                "plain_text": "",
-                "title": "Crawl Error",
-                "category": "Error",
-                "meta_description": "",
-                "author": "N/A",
-                "published_date": "N/A",
-                "canonical_url": current_url,
-                "headings": [],
-                "sections": [],
-                "cards": [],
-                "images": [],
-                "links": [],
-                "tables": [],
-                "json_ld": [],
-                "quality": {},
-                "warnings": ["navigation_failure"],
-                "error": {"code": "navigation_error", "message": str(error)},
-                "depth": depth,
-                "fetch_time_ms": 0.0,
-                "extraction_time_ms": 0.0,
-                "content_bytes": 0
-            }
-            self.results.append(rec)
-            if on_page_crawled:
-                on_page_crawled(rec, self.stats)
+                logger.warning(f"Crawlee failed request for {current_url}: {error}")
+                resp = getattr(context, "response", None)
+                http_status = getattr(resp, "status", None) if resp else None
+
+                rec = {
+                    "url": current_url,
+                    "final_url": None,
+                    "status": "ERROR",
+                    "http_status": http_status,
+                    "crawl_method": "crawlee_playwright",
+                    "rendered": False,
+                    "content_complete": False,
+                    "raw_html": "",
+                    "rendered_html": "",
+                    "cleaned_html": "",
+                    "markdown": "",
+                    "plain_text": "",
+                    "title": "Crawl Error",
+                    "category": "Error",
+                    "meta_description": "",
+                    "author": "N/A",
+                    "published_date": "N/A",
+                    "canonical_url": current_url,
+                    "headings": [],
+                    "sections": [],
+                    "cards": [],
+                    "images": [],
+                    "links": [],
+                    "tables": [],
+                    "json_ld": [],
+                    "quality": {
+                        "word_count": 0,
+                        "character_count": 0,
+                        "headings_count": 0,
+                        "sections_count": 0,
+                        "cards_count": 0,
+                        "images_count": 0,
+                        "links_count": 0,
+                        "tables_count": 0,
+                        "duplicate_blocks_count": 0,
+                        "duplicate_blocks": []
+                    },
+                    "warnings": ["navigation_failure"],
+                    "error": {"code": "navigation_error", "message": str(error)},
+                    "depth": depth,
+                    "fetch_time_ms": 0.0,
+                    "extraction_time_ms": 0.0,
+                    "content_bytes": 0
+                }
+                self.results.append(rec)
+                if on_page_crawled:
+                    try:
+                        on_page_crawled(rec, self.stats)
+                    except Exception as cb_err:
+                        logger.debug(f"on_page_crawled callback error: {cb_err}")
+            except Exception as handler_err:
+                logger.error(f"Error inside failed_request_handler: {handler_err}")
 
         # Execute the crawl
         try:
