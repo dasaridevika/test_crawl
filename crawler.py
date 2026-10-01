@@ -181,7 +181,8 @@ class CrawleeWebCrawler:
                 desired_concurrency=concurrency
             ),
             headless=True,
-            browser_new_context_options={"user_agent": self.config.user_agent}
+            browser_new_context_options={"user_agent": self.config.user_agent},
+            goto_options={"wait_until": "domcontentloaded"}
         )
 
         @crawler.router.default_handler

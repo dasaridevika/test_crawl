@@ -170,7 +170,8 @@ async def fetch_page(url: str, timeout: int = 30) -> Dict[str, Any]:
         max_requests_per_crawl=1,
         max_request_retries=1,
         headless=True,
-        browser_new_context_options={"user_agent": USER_AGENT}
+        browser_new_context_options={"user_agent": USER_AGENT},
+        goto_options={"wait_until": "domcontentloaded"}
     )
 
     @crawler.router.default_handler

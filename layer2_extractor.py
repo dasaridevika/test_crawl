@@ -1,28 +1,25 @@
 """
-Layer 2: Exact, Lossless Content Extractor
-==========================================
-Extracts the complete text and markdown content from the rendered DOM exactly as it appears
-on the actual website:
-- Zero truncation
-- Zero missing sections or paragraphs
-- Exact document reading order
-- Full preservation of headings, paragraphs, lists, links, tables, and media captions
-- Multi-representation: Rendered HTML, Clean Formatted Markdown, and Full Plain Text
+Layer 2: Pure Text & Markdown Content Extractor (No Image Clutter, No Cookie Banners)
+====================================================================================
+Extracts 100% complete, un-truncated editorial content:
+- Removes cookie consent banners (OneTrust, Optanon, Cookiebot, etc.)
+- Strips all images, icons, and SVG data URIs for clean, distraction-free reading
+- Preserves exact headings (#, ##, ###), paragraphs, lists (-), and data tables
+- Resolves real hyperlinks while eliminating broken '#' fragment anchors
 """
 
 import html as html_lib
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, Tag
 import markdownify
 
 
 def clean_whitespace(text: str) -> str:
-    """Normalizes excessive blank lines while preserving paragraph breaks."""
+    """Normalizes excessive blank lines while preserving paragraph and heading structure."""
     lines = [line.strip() for line in text.splitlines()]
-    # Remove consecutive empty lines
     cleaned_lines = []
     prev_empty = False
     for line in lines:
@@ -38,8 +35,8 @@ def clean_whitespace(text: str) -> str:
 
 def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
     """
-    Extracts 100% complete, non-truncated content from rendered HTML.
-    Preserves exact site hierarchy, headings, links, tables, and text.
+    Extracts 100% complete editorial content without image clutter,
+    cookie consent banners, or broken anchor links.
     """
     if not rendered_html or not rendered_html.strip():
         return {
@@ -53,69 +50,72 @@ def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
             "rendered_html": ""
         }
 
-    soup = BeautifulSoup(rendered_html, "html.parser")
-
-    # 1. Page Title
-    title_tag = soup.find("title")
-    h1_tag = soup.find("h1")
+    # 1. Page Title & Meta
+    raw_soup = BeautifulSoup(rendered_html, "html.parser")
+    title_tag = raw_soup.find("title")
+    h1_tag = raw_soup.find("h1")
     title = title_tag.get_text(" ", strip=True) if title_tag else (h1_tag.get_text(" ", strip=True) if h1_tag else "Untitled")
     title = re.sub(r"\s+", " ", title).strip()
 
-    # 2. Meta Description
     meta_description = ""
-    meta_desc_tag = soup.find("meta", attrs={"name": re.compile(r"description", re.I)}) or \
-                    soup.find("meta", attrs={"property": re.compile(r"og:description", re.I)})
+    meta_desc_tag = raw_soup.find("meta", attrs={"name": re.compile(r"description", re.I)}) or \
+                    raw_soup.find("meta", attrs={"property": re.compile(r"og:description", re.I)})
     if meta_desc_tag and meta_desc_tag.get("content"):
         meta_description = meta_desc_tag["content"].strip()
 
-    # 3. Create a working DOM tree for content extraction
+    # 2. Build Clean Content DOM
     content_soup = BeautifulSoup(rendered_html, "html.parser")
 
-    # Remove non-visible / executable tags only (preserving all visual content)
-    for el in content_soup(["script", "style", "noscript", "svg", "iframe"]):
-        el.decompose()
+    # Remove non-content & media tags completely (No images, No SVGs, No video/audio)
+    for tag in content_soup(["script", "style", "noscript", "svg", "img", "picture", "source", "canvas", "video", "audio", "iframe", "button", "input", "select", "option", "form"]):
+        tag.decompose()
 
     # Remove HTML comments
     for comment in content_soup.find_all(string=lambda s: isinstance(s, Comment)):
         comment.extract()
 
-    # Target body or root
+    # Remove Cookie Banners, Consent Modals, and Overlay Clutter
+    cookie_and_modal_selectors = [
+        "#onetrust-consent-sdk", "#onetrust-banner-sdk", "#onetrust-pc-sdk",
+        ".optanon-alert-box-wrapper", ".cookie-banner", ".ot-sdk-container",
+        ".region-selector-modal", ".country-selector", ".modal-backdrop",
+        "[id*='cookie']", "[id*='consent']", "[class*='cookie']", "[class*='consent']",
+        "[role='dialog']", "[role='alertdialog']", "[aria-modal='true']",
+        ".skip-to-content", ".skip-link"
+    ]
+    for sel in cookie_and_modal_selectors:
+        for el in content_soup.select(sel):
+            el.decompose()
+
     body = content_soup.find("body") or content_soup
 
-    # Ensure all relative URLs in links and images are converted to absolute URLs
-    for a in body.find_all("a", href=True):
-        href = a["href"].strip()
-        if href and not href.startswith(("javascript:", "mailto:", "tel:", "#")):
-            a["href"] = urljoin(url, href)
+    # Clean links: Keep real http/https links, remove empty '#' or javascript links
+    for a in body.find_all("a"):
+        href = a.get("href", "").strip()
+        link_text = a.get_text(" ", strip=True)
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")) or not link_text:
+            a.unwrap()
+        else:
+            abs_url = urljoin(url, href)
+            a["href"] = abs_url
 
-    for img in body.find_all("img"):
-        src = (
-            img.get("src")
-            or img.get("data-src")
-            or img.get("data-original")
-            or img.get("data-lazy-src")
-            or (img.get("srcset", "").split()[0] if img.get("srcset") else None)
-        )
-        if src and not src.startswith("data:"):
-            img["src"] = urljoin(url, src)
-
-    # Convert HTML to clean, readable Markdown preserving all headings, bold text, links, lists, and tables
+    # Convert to clean, readable Markdown (headings, lists, paragraphs, tables)
     cleaned_html = str(body)
     
     markdown_content = markdownify.markdownify(
         cleaned_html,
         heading_style="ATX",
         bullets_style="-",
-        strip=["script", "style", "noscript", "svg", "iframe"],
-        autolinks=False
+        autolinks=False,
+        strip=["img", "picture", "svg", "canvas", "script", "style"]
     )
     markdown_content = clean_whitespace(markdown_content)
 
-    # Generate full plain text preserving natural line breaks and indentation
+    # Convert to pure plain text
     plain_text = body.get_text(separator="\n", strip=True)
     plain_text = clean_whitespace(plain_text)
 
-    # Word count and character count metrics
+    # Calculate word count & character count
     word_count = len(re.findall(r"\w+", plain_text))
     character_count = len(plain_text)
 
@@ -145,24 +145,20 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    test_url = sys.argv[1] if len(sys.argv) > 1 else "https://www.nvidia.com/en-in/"
-    print(f"\n[Layer 1 + Layer 2 Test] Fetching & Extracting 100% Exact Content: {test_url}\n" + "=" * 70)
+    test_url = sys.argv[1] if len(sys.argv) > 1 else "https://www.nvidia.com/en-gb/about-nvidia"
+    print(f"\n[Testing Clean Content Extractor on]: {test_url}\n" + "=" * 75)
 
-    # 1. Fetch via Layer 1
     fetch_res = asyncio.run(fetch_page(test_url))
-
     if fetch_res["status"] != "SUCCESS":
-        print(f"Fetch failed with status: {fetch_res['status']} - Error: {fetch_res['error']}")
+        print(f"Fetch failed: {fetch_res['status']}")
         sys.exit(1)
 
-    # 2. Extract complete content via Layer 2
     extracted = extract_exact_content(fetch_res["rendered_html"], fetch_res["final_url"])
 
-    print(f"Page Title      : {extracted['title']}")
-    print(f"Total Words     : {extracted['word_count']:,} words (100% complete)")
-    print(f"Total Characters: {extracted['character_count']:,} chars")
-    print(f"DOM Size        : {len(extracted['rendered_html'].encode('utf-8')):,} bytes")
-    print("=" * 70)
-    print("\n--- EXACT EXTRACTED CONTENT PREVIEW (First 2,500 characters) ---\n")
-    print(extracted["plain_text"][:2500])
-    print("\n...\n" + "=" * 70)
+    print(f"Title       : {extracted['title']}")
+    print(f"Total Words : {extracted['word_count']:,} words")
+    print(f"Total Chars : {extracted['character_count']:,} chars")
+    print("=" * 75)
+    print("\n--- CLEAN MARKDOWN CONTENT PREVIEW ---\n")
+    print(extracted["markdown"][:2500])
+    print("\n...\n" + "=" * 75)
