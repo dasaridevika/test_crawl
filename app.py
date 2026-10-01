@@ -114,9 +114,20 @@ if extract_clicked:
                 progress_bar.progress(frac)
                 status_text.caption(f"Extracting: {record.get('url', '')} | Pages: {attempted}/{config.max_pages}")
 
+            def run_crawler_sync(engine, cb):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(engine.crawl(on_page_crawled=cb))
+                finally:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+
             try:
                 with st.spinner("Extracting content..."):
-                    results = asyncio.run(crawler.crawl(on_page_crawled=handle_progress))
+                    results = run_crawler_sync(crawler, handle_progress)
                 
                 st.session_state["crawl_results"] = results
                 st.session_state["crawl_stats"] = crawler.stats
