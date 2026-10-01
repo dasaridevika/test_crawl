@@ -110,6 +110,12 @@ if extract_clicked:
                 status_text.caption(f"Extracting: {record.get('url', '')} | Pages: {attempted}/{config.max_pages}")
 
             def run_sync():
+                import sys
+                if sys.platform == "win32":
+                    try:
+                        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                    except Exception:
+                        pass
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
@@ -232,6 +238,8 @@ if results:
 
         with tab_rendered:
             st.markdown(f"## {page.get('title', 'Untitled')}")
+            if page.get("error"):
+                st.error(f"Error Details: {page.get('error')}")
             if page.get("meta_description"):
                 st.info(page.get("meta_description"))
             st.markdown(page.get("markdown", "*No content available.*"))

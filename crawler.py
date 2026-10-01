@@ -156,8 +156,9 @@ class CrawleeWebCrawler:
             discovered_sitemaps = self.sitemaps.discover(self.robots.sitemaps)
             logger.info(f"Discovered {len(discovered_sitemaps)} seed URLs from sitemaps")
 
-        # 4. Initialize Crawlee RequestQueue
-        request_queue = await RequestQueue.open()
+        # 4. Initialize Unique Crawlee RequestQueue
+        queue_name = f"crawl_queue_{int(time.time() * 1000)}"
+        request_queue = await RequestQueue.open(name=queue_name)
         norm_seed = normalize_url(self.config.seed_url, self.config.seed_url) or self.config.seed_url
         self.seen_urls.add(norm_seed)
         await request_queue.add_request(Request.from_url(norm_seed, user_data={"depth": 0}))
