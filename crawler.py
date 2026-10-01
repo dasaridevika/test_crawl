@@ -597,8 +597,8 @@ class CrawleeWebCrawler:
         if self.config.discover_sitemaps:
             discovered_sitemaps = self.sitemaps.discover(self.robots.sitemaps)
 
-        # 4. Initialize Unique RequestQueue
-        queue_name = f"crawl_queue_{int(time.time() * 1000)}"
+        # 4. Initialize Unique RequestQueue (hyphen-separated name for Crawlee validation)
+        queue_name = f"crawl-queue-{int(time.time() * 1000)}"
         request_queue = await RequestQueue.open(name=queue_name)
         norm_seed = normalize_url(self.config.seed_url, self.config.seed_url) or self.config.seed_url
         self.seen_urls.add(norm_seed)
@@ -628,8 +628,7 @@ class CrawleeWebCrawler:
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process" if sys.platform != "win32" and "STREAMLIT" in os.environ else ""
+                    "--disable-gpu"
                 ]
             },
             browser_new_context_options={"user_agent": self.config.user_agent},
