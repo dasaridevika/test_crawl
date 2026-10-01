@@ -17,10 +17,16 @@ import sys
 import unittest
 import pandas as pd
 
-from layer1_fetcher import is_safe_url, detect_access_challenge
-from layer2_extractor import extract_exact_content
-from layer3_frontier import normalize_url, is_in_scope, RobotsManager
-from crawler import CrawlConfig, CrawleeWebCrawler
+from crawler import (
+    CrawlConfig,
+    CrawleeWebCrawler,
+    is_safe_url,
+    detect_access_challenge,
+    extract_exact_content,
+    normalize_url,
+    is_in_scope,
+    RobotsManager
+)
 
 class TestAllLayers(unittest.TestCase):
     def test_layer1_ssrf_safety(self):

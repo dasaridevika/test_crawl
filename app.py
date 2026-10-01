@@ -12,8 +12,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from crawler import CrawlConfig, CrawleeWebCrawler
-from layer1_fetcher import is_safe_url
+from crawler import CrawlConfig, CrawleeWebCrawler, is_safe_url
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & MINIMAL STYLING
