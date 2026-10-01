@@ -272,6 +272,15 @@ class RobotsManager:
         except Exception:
             return True
 
+    def get_crawl_delay(self) -> Optional[float]:
+        if not self._fetched:
+            self.fetch()
+        try:
+            delay = self.parser.crawl_delay(self.user_agent)
+            return float(delay) if delay is not None else None
+        except Exception:
+            return None
+
 
 class SitemapDiscoverer:
     """Discovers in-scope URLs from sitemap.xml and nested sitemap indexes."""
@@ -1111,8 +1120,13 @@ class CrawleePlaywrightCrawlerEngine:
             return self.results
 
         # 2. Discover Sitemaps & Robots.txt
+        effective_delay = self.config.delay
         if self.config.respect_robots:
             self.robots.fetch()
+            r_delay = self.robots.get_crawl_delay()
+            if r_delay is not None and r_delay > effective_delay:
+                effective_delay = min(r_delay, 10.0)
+                logger.info(f"Applying robots.txt Crawl-delay of {effective_delay}s")
 
         discovered_sitemap_urls: List[str] = []
         if self.config.discover_sitemaps:
@@ -1155,9 +1169,9 @@ class CrawleePlaywrightCrawlerEngine:
             depth = user_data.get("depth", 0)
             self.stats["attempted"] += 1
 
-            # Rate Limit Delay
-            if self.config.delay > 0:
-                await asyncio.sleep(self.config.delay)
+            # Rate Limit Delay (Politeness)
+            if effective_delay > 0:
+                await asyncio.sleep(effective_delay)
 
             # Robots.txt Check
             if self.config.respect_robots and not self.robots.can_fetch(current_url):
