@@ -446,26 +446,43 @@ def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
     # Build clean DOM tree
     content_soup = BeautifulSoup(rendered_html, "html.parser")
 
-    # Decompose non-content, media, and form tags (No images, No SVGs)
-    for tag in content_soup(["script", "style", "noscript", "svg", "img", "picture", "source", "canvas", "video", "audio", "iframe", "button", "input", "select", "option", "form"]):
+    # Decompose non-content, media, forms, and layout shells
+    for tag in content_soup(["script", "style", "noscript", "svg", "img", "picture", "source", "canvas", "video", "audio", "iframe", "button", "input", "select", "option", "form", "header", "nav", "footer"]):
         tag.decompose()
 
     # Remove HTML comments
     for comment in content_soup.find_all(string=lambda s: isinstance(s, Comment)):
         comment.extract()
 
-    # Remove Cookie Banners & Consent Modals
-    cookie_and_modal_selectors = [
+    # Comprehensive boilerplate removal: mega-menus, drawers, banners, indicators, footers
+    boilerplate_selectors = [
+        # Navigation & Mega-menus
+        "[role='navigation']", "[role='contentinfo']", "[role='banner']",
+        ".mega-menu", ".global-nav", ".navbar", ".navigation", ".site-header", ".site-footer",
+        ".drawer-menu", ".mobile-menu", ".gn-header", ".header-container", ".main-nav",
+        # Cookie Banners & Consent Modals
         "#onetrust-consent-sdk", "#onetrust-banner-sdk", "#onetrust-pc-sdk",
         ".optanon-alert-box-wrapper", ".cookie-banner", ".ot-sdk-container",
-        ".region-selector-modal", ".country-selector", ".modal-backdrop",
-        "[id*='cookie']", "[id*='consent']", "[class*='cookie']", "[class*='consent']",
+        ".region-selector-modal", ".country-selector", ".region-banner", ".country-banner", ".locale-banner",
+        ".modal-backdrop", "[id*='cookie']", "[id*='consent']", "[class*='cookie']", "[class*='consent']",
         "[role='dialog']", "[role='alertdialog']", "[aria-modal='true']",
-        ".skip-to-content", ".skip-link"
+        # Accessibility skip links
+        ".skip-to-content", ".skip-link", "a[href*='#main']", "a[href*='#content']",
+        # Carousel Indicators & Thumbnail Labels
+        ".cmp-carousel__indicators", ".cmp-carousel__actions", ".cmp-carousel__indicator",
+        ".carousel-indicators", ".swiper-pagination", ".slick-dots", ".slider-nav",
+        # Footer link directories & Copyright blocks
+        "#globalFooter", ".global-footer", ".global-footer-container",
+        ".page-footer", ".page-footer__links", ".page-footer-link-set",
+        "[class*='global-footer']", "[class*='site-footer']", "[class*='page-footer']",
+        "[id*='globalFooter']", "[id*='footer']"
     ]
-    for sel in cookie_and_modal_selectors:
-        for el in content_soup.select(sel):
-            el.decompose()
+    for sel in boilerplate_selectors:
+        try:
+            for el in content_soup.select(sel):
+                el.decompose()
+        except Exception:
+            pass
 
     body = content_soup.find("body") or content_soup
 
