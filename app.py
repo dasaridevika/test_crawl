@@ -65,15 +65,28 @@ with col_btn:
 
 # Advanced Options (Collapsible Expander)
 with st.expander("⚙️ Advanced Crawl Settings", expanded=False):
-    c1, c2, c3, c4 = st.columns(4)
+    c_mode, c1, c2, c3, c4 = st.columns([2, 1, 1, 1, 1])
+    with c_mode:
+        crawl_mode_label = st.selectbox(
+            "Crawl Speed & Mode",
+            options=["⚡ Turbo (Adaptive Fast)", "🌐 Full Headless Browser", "🏎️ Fast HTTP Only"],
+            index=0,
+            help="Turbo uses ultra-fast async HTTP with automatic Chromium rendering for dynamic JavaScript SPAs."
+        )
+        mode_mapping = {
+            "⚡ Turbo (Adaptive Fast)": "turbo",
+            "🌐 Full Headless Browser": "browser",
+            "🏎️ Fast HTTP Only": "http"
+        }
+        selected_mode = mode_mapping.get(crawl_mode_label, "turbo")
     with c1:
         max_pages = st.number_input("Max Pages", min_value=1, max_value=200, value=10, step=5)
     with c2:
         max_depth = st.number_input("Max Depth", min_value=0, max_value=5, value=2, step=1)
     with c3:
-        concurrency = st.number_input("Concurrency", min_value=1, max_value=4, value=2, step=1)
+        concurrency = st.number_input("Concurrency", min_value=1, max_value=8, value=3, step=1)
     with c4:
-        request_delay = st.number_input("Delay (s)", min_value=0.0, max_value=3.0, value=0.3, step=0.1)
+        request_delay = st.number_input("Delay (s)", min_value=0.0, max_value=3.0, value=0.1, step=0.1)
 
 # -----------------------------------------------------------------------------
 # CRAWL EXECUTION
@@ -100,7 +113,8 @@ if extract_clicked:
                 max_pages=int(max_pages),
                 max_depth=int(max_depth),
                 concurrency=int(concurrency),
-                delay=float(request_delay)
+                delay=float(request_delay),
+                crawl_mode=selected_mode
             )
 
             crawler = CrawleeWebCrawler(config)

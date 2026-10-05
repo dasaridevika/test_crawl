@@ -523,6 +523,7 @@ class CrawlConfig:
     allow_subdomains: bool = False
     respect_robots: bool = True
     discover_sitemaps: bool = True
+    crawl_mode: str = "turbo"  # "turbo" (Adaptive Hybrid), "browser" (Playwright), "http" (Fast HTTP)
     user_agent: str = USER_AGENT
 
 
@@ -591,6 +592,43 @@ def fetch_html_fallback(url: str, user_agent: str = USER_AGENT, timeout: int = 1
         return 0, "", url
 
 
+async def render_single_page_playwright(url: str, user_agent: str = USER_AGENT, timeout: int = 15) -> Tuple[int, str, str]:
+    """Fast single-page headless Chromium render with heavy media/tracker blocking."""
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            context = await browser.new_context(user_agent=user_agent)
+            page = await context.new_page()
+
+            async def route_filter(route):
+                if route.request.resource_type in ["image", "media", "font"]:
+                    await route.abort()
+                elif any(t in route.request.url.lower() for t in ["google-analytics", "doubleclick", "facebook.net", "googletagmanager", "hotjar"]):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", route_filter)
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            status_code = resp.status if resp else 200
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
+            content = await page.content()
+            final_url = page.url or url
+            await browser.close()
+            return status_code, content, final_url
+    except Exception as e:
+        logger.warning(f"Playwright single render error for {url}: {e}")
+        return 0, "", url
+
+
 # -----------------------------------------------------------------------------
 # CRAWLEE PLAYWRIGHT CRAWLER ENGINE
 # -----------------------------------------------------------------------------
@@ -617,7 +655,7 @@ class CrawleeWebCrawler:
 
     async def crawl(self, on_page_crawled: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None) -> List[Dict[str, Any]]:
         start_time = time.perf_counter()
-        logger.info(f"Starting Crawl on {self.config.seed_url} (max_pages={self.config.max_pages}, max_depth={self.config.max_depth})")
+        logger.info(f"Starting Crawl on {self.config.seed_url} (mode={self.config.crawl_mode}, max_pages={self.config.max_pages}, max_depth={self.config.max_depth})")
         ensure_playwright_browsers()
 
         # 1. Security check
@@ -663,7 +701,11 @@ class CrawleeWebCrawler:
         if self.config.discover_sitemaps:
             discovered_sitemaps = self.sitemaps.discover(self.robots.sitemaps)
 
-        # 4. Initialize Unique RequestQueue (hyphen-separated name for Crawlee validation)
+        # 4. Route to Fast Hybrid / HTTP Engine for maximum efficiency
+        if self.config.crawl_mode in ["turbo", "http"]:
+            return await self._crawl_fast(on_page_crawled, start_time, effective_delay, discovered_sitemaps)
+
+        # 5. Initialize Unique RequestQueue for Full Browser Mode
         queue_name = f"crawl-queue-{int(time.time() * 1000)}"
         request_queue = await RequestQueue.open(name=queue_name)
         norm_seed = normalize_url(self.config.seed_url, self.config.seed_url) or self.config.seed_url
@@ -675,7 +717,7 @@ class CrawleeWebCrawler:
                 self.seen_urls.add(s_url)
                 await request_queue.add_request(Request.from_url(s_url, user_data={"depth": 1}))
 
-        # 5. Initialize Crawlee PlaywrightCrawler with Linux sandbox flags
+        # 6. Initialize Crawlee PlaywrightCrawler with Linux sandbox flags & resource route blocking
         concurrency = max(1, self.config.concurrency)
         crawler = PlaywrightCrawler(
             request_manager=request_queue,
@@ -742,12 +784,22 @@ class CrawleeWebCrawler:
 
             if page:
                 try:
+                    async def route_filter(route):
+                        if route.request.resource_type in ["image", "media", "font"]:
+                            await route.abort()
+                        elif any(t in route.request.url.lower() for t in ["google-analytics", "doubleclick", "facebook.net", "googletagmanager", "hotjar"]):
+                            await route.abort()
+                        else:
+                            await route.continue_()
+                    await page.route("**/*", route_filter)
+                except Exception:
+                    pass
+
+                try:
                     await page.wait_for_load_state("domcontentloaded")
                     await page.evaluate("""async () => {
                         window.scrollTo(0, document.body.scrollHeight / 2);
-                        await new Promise(r => setTimeout(r, 200));
-                        window.scrollTo(0, document.body.scrollHeight);
-                        await new Promise(r => setTimeout(r, 200));
+                        await new Promise(r => setTimeout(r, 100));
                         window.scrollTo(0, 0);
                     }""")
                 except Exception:
@@ -925,6 +977,179 @@ class CrawleeWebCrawler:
                 f"{len(self.results)} pages extracted. {remaining} additional eligible URLs were not crawled "
                 f"because the configured limit ({self.config.max_pages}) was reached."
             )
+        else:
+            self.stats["crawl_completion_status"] = "COMPLETED_ALL_DISCOVERED"
+            self.stats["completion_message"] = f"Crawl completed! Extracted {len(self.results)} pages in {self.stats['elapsed_seconds']}s."
+
+        return self.results
+
+    async def _crawl_fast(
+        self,
+        on_page_crawled: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]],
+        start_time: float,
+        effective_delay: float,
+        discovered_sitemaps: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Ultra-fast concurrent async crawler with automatic SPA Chromium promotion."""
+        queue: asyncio.Queue = asyncio.Queue()
+        norm_seed = normalize_url(self.config.seed_url, self.config.seed_url) or self.config.seed_url
+        self.seen_urls.add(norm_seed)
+        await queue.put((norm_seed, 0))
+
+        for s_url in discovered_sitemaps:
+            if s_url not in self.seen_urls and len(self.seen_urls) < self.config.max_pages * 3:
+                self.seen_urls.add(s_url)
+                await queue.put((s_url, 1))
+
+        lock = asyncio.Lock()
+
+        async def worker():
+            while True:
+                if len(self.results) >= self.config.max_pages:
+                    break
+                try:
+                    current_url, depth = await asyncio.wait_for(queue.get(), timeout=1.5)
+                except asyncio.TimeoutError:
+                    break
+
+                if len(self.results) >= self.config.max_pages:
+                    queue.task_done()
+                    break
+
+                if effective_delay > 0:
+                    await asyncio.sleep(effective_delay)
+
+                if self.config.respect_robots and not self.robots.can_fetch(current_url):
+                    rec = {
+                        "url": current_url,
+                        "final_url": None,
+                        "status": "SKIPPED_ROBOTS",
+                        "http_status": None,
+                        "title": "Disallowed by robots.txt",
+                        "word_count": 0,
+                        "character_count": 0,
+                        "markdown": "",
+                        "plain_text": "",
+                        "rendered_html": "",
+                        "error": None,
+                        "depth": depth,
+                        "fetch_time_ms": 0.0
+                    }
+                    async with lock:
+                        self.results.append(rec)
+                        self.stats["attempted"] += 1
+                        self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+                    if on_page_crawled:
+                        try:
+                            on_page_crawled(rec, self.stats)
+                        except Exception:
+                            pass
+                    queue.task_done()
+                    continue
+
+                t0 = time.perf_counter()
+                http_status, html_text, final_url = await asyncio.to_thread(
+                    fetch_html_fallback, current_url, self.config.user_agent, self.config.timeout
+                )
+
+                # Check if SPA / Dynamic JS rendering is needed (thin DOM or JS app roots)
+                is_spa = False
+                if self.config.crawl_mode == "turbo" and html_text and http_status < 400:
+                    lower_html = html_text.lower()
+                    if ("<div id=\"root\"></div>" in lower_html or "<div id=\"app\"></div>" in lower_html or "<div id=\"__next\"></div>" in lower_html or "you need to enable javascript" in lower_html):
+                        is_spa = True
+
+                if is_spa:
+                    p_status, p_html, p_final = await render_single_page_playwright(current_url, self.config.user_agent, self.config.timeout)
+                    if p_html and p_status < 400:
+                        http_status, html_text, final_url = p_status, p_html, p_final
+
+                fetch_time_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+                if html_text and http_status < 400:
+                    extracted = extract_exact_content(html_text, final_url)
+                    is_blocked, marker = detect_access_challenge(http_status, html_text)
+                    status = "BLOCKED" if is_blocked else "SUCCESS"
+
+                    record = {
+                        "url": current_url,
+                        "final_url": final_url,
+                        "status": status,
+                        "http_status": http_status,
+                        "title": extracted["title"],
+                        "meta_description": extracted["meta_description"],
+                        "word_count": extracted["word_count"],
+                        "character_count": extracted["character_count"],
+                        "markdown": extracted["markdown"],
+                        "plain_text": extracted["plain_text"],
+                        "rendered_html": html_text,
+                        "error": {"code": "access_challenge", "message": marker} if is_blocked else None,
+                        "depth": depth,
+                        "fetch_time_ms": fetch_time_ms
+                    }
+
+                    async with lock:
+                        self.results.append(record)
+                        self.stats["attempted"] += 1
+                        if status == "SUCCESS":
+                            self.stats["successful"] += 1
+                            self.stats["total_words"] += extracted["word_count"]
+                            self.stats["total_bytes"] += len(html_text.encode("utf-8"))
+                        else:
+                            self.stats["blocked"] += 1
+                        self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+
+                    # Link discovery
+                    if depth < self.config.max_depth and status == "SUCCESS":
+                        soup = BeautifulSoup(html_text, "html.parser")
+                        for a in soup.find_all("a", href=True):
+                            raw_href = a["href"].strip()
+                            norm = normalize_url(raw_href, final_url)
+                            if norm and norm not in self.seen_urls:
+                                if is_in_scope(norm, self.config.seed_url, self.config.allow_subdomains):
+                                    safe_l, _ = is_safe_url(norm)
+                                    if safe_l:
+                                        self.seen_urls.add(norm)
+                                        await queue.put((norm, depth + 1))
+                else:
+                    rec = {
+                        "url": current_url,
+                        "final_url": None,
+                        "status": "ERROR",
+                        "http_status": http_status or None,
+                        "title": "Crawl Error",
+                        "meta_description": "",
+                        "word_count": 0,
+                        "character_count": 0,
+                        "markdown": "",
+                        "plain_text": "",
+                        "rendered_html": "",
+                        "error": {"code": "fetch_error", "message": f"HTTP status {http_status}"},
+                        "depth": depth,
+                        "fetch_time_ms": fetch_time_ms
+                    }
+                    async with lock:
+                        self.results.append(rec)
+                        self.stats["attempted"] += 1
+                        self.stats["failed"] += 1
+                        self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+                    record = rec
+
+                if on_page_crawled:
+                    try:
+                        on_page_crawled(record, self.stats)
+                    except Exception:
+                        pass
+                queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(max(1, self.config.concurrency))]
+        await asyncio.gather(*workers)
+
+        self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+        remaining = queue.qsize()
+        if len(self.results) >= self.config.max_pages and remaining > 0:
+            self.stats["crawl_completion_status"] = "PARTIAL_LIMIT_REACHED"
+            self.stats["completion_message"] = f"{len(self.results)} pages extracted. Reached configured limit ({self.config.max_pages})."
         else:
             self.stats["crawl_completion_status"] = "COMPLETED_ALL_DISCOVERED"
             self.stats["completion_message"] = f"Crawl completed! Extracted {len(self.results)} pages in {self.stats['elapsed_seconds']}s."
