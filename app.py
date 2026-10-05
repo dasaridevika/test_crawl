@@ -69,16 +69,16 @@ with st.expander("⚙️ Advanced Crawl Settings", expanded=False):
     with c_mode:
         crawl_mode_label = st.selectbox(
             "Crawl Speed & Mode",
-            options=["⚡ Turbo (Adaptive Fast)", "🌐 Full Headless Browser", "🏎️ Fast HTTP Only"],
+            options=["🌐 Full Headless Browser (Playwright)", "⚡ Turbo (Adaptive Hybrid)", "🏎️ Fast HTTP Only"],
             index=0,
-            help="Turbo uses ultra-fast async HTTP with automatic Chromium rendering for dynamic JavaScript SPAs."
+            help="Full Headless Browser uses Playwright Chromium with media/tracker blocking for 100% reliable JS extraction."
         )
         mode_mapping = {
-            "⚡ Turbo (Adaptive Fast)": "turbo",
-            "🌐 Full Headless Browser": "browser",
+            "🌐 Full Headless Browser (Playwright)": "browser",
+            "⚡ Turbo (Adaptive Hybrid)": "turbo",
             "🏎️ Fast HTTP Only": "http"
         }
-        selected_mode = mode_mapping.get(crawl_mode_label, "turbo")
+        selected_mode = mode_mapping.get(crawl_mode_label, "browser")
     with c1:
         max_pages = st.number_input("Max Pages", min_value=1, max_value=200, value=10, step=5)
     with c2:

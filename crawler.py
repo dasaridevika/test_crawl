@@ -540,7 +540,7 @@ class CrawlConfig:
     allow_subdomains: bool = False
     respect_robots: bool = True
     discover_sitemaps: bool = True
-    crawl_mode: str = "turbo"  # "turbo" (Adaptive Hybrid), "browser" (Playwright), "http" (Fast HTTP)
+    crawl_mode: str = "browser"  # "browser" (Playwright + Resource Blocking), "turbo" (Adaptive Fast), "http" (Fast HTTP)
     user_agent: str = USER_AGENT
 
 
@@ -1071,12 +1071,13 @@ class CrawleeWebCrawler:
 
                 # Check if SPA / Dynamic JS rendering is needed (thin DOM or JS app roots)
                 is_spa = False
-                if self.config.crawl_mode == "turbo" and html_text and http_status < 400:
+                if html_text and http_status < 400:
                     lower_html = html_text.lower()
                     if ("<div id=\"root\"></div>" in lower_html or "<div id=\"app\"></div>" in lower_html or "<div id=\"__next\"></div>" in lower_html or "you need to enable javascript" in lower_html):
                         is_spa = True
 
-                if is_spa:
+                # If HTTP fetch was empty/blocked/0 or requires dynamic JS, render with Playwright
+                if not html_text or http_status == 0 or http_status >= 400 or is_spa:
                     p_status, p_html, p_final = await render_single_page_playwright(current_url, self.config.user_agent, self.config.timeout)
                     if p_html and p_status < 400:
                         http_status, html_text, final_url = p_status, p_html, p_final
