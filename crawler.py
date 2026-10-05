@@ -540,8 +540,7 @@ class CrawlConfig:
     allow_subdomains: bool = False
     respect_robots: bool = True
     discover_sitemaps: bool = True
-    crawl_mode: str = "jina"  # "jina" (Jina Reader API), "browser" (Playwright), "turbo" (Adaptive Fast), "http" (Fast HTTP)
-    jina_api_key: Optional[str] = None
+    crawl_mode: str = "browser"  # "browser" (Playwright), "turbo" (Adaptive Fast), "http" (Fast HTTP)
     user_agent: str = USER_AGENT
 
 
