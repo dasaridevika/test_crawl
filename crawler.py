@@ -88,7 +88,7 @@ DISALLOWED_IPS = {
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 (Compatible; Crawlee-Playwright/1.0)"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 
@@ -540,8 +540,85 @@ class CrawlConfig:
     allow_subdomains: bool = False
     respect_robots: bool = True
     discover_sitemaps: bool = True
-    crawl_mode: str = "browser"  # "browser" (Playwright + Resource Blocking), "turbo" (Adaptive Fast), "http" (Fast HTTP)
+    crawl_mode: str = "jina"  # "jina" (Jina Reader API), "browser" (Playwright), "turbo" (Adaptive Fast), "http" (Fast HTTP)
+    jina_api_key: Optional[str] = None
     user_agent: str = USER_AGENT
+
+
+# -----------------------------------------------------------------------------
+# JINA READER (r.jina.ai) FETCHER & FAST PARSER
+# -----------------------------------------------------------------------------
+def fetch_jina_reader(url: str, api_key: Optional[str] = None, timeout: int = 30) -> Dict[str, Any]:
+    """Fetches clean Markdown and metadata using Jina Reader (r.jina.ai)."""
+    import ssl
+    jina_endpoint = f"https://r.jina.ai/{url}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = URLRequest(jina_endpoint, headers=headers)
+
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            status_code = response.getcode()
+            raw_data = response.read()
+            encoding = response.info().get("Content-Encoding", "").lower()
+            if "gzip" in encoding:
+                raw_data = gzip.decompress(raw_data)
+            payload = json.loads(raw_data.decode("utf-8", errors="replace"))
+            data = payload.get("data", {})
+            
+            title = data.get("title") or "Untitled"
+            desc = data.get("description") or ""
+            markdown_content = data.get("content") or ""
+            final_url = data.get("url") or url
+
+            # Generate plain text from markdown
+            plain_text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", markdown_content)
+            plain_text = re.sub(r"[#*`_~>-]", " ", plain_text)
+            plain_text = clean_whitespace(plain_text)
+            word_count = len(re.findall(r"\w+", plain_text))
+
+            # Extract discovered links for crawling
+            discovered_links = []
+            for match in re.findall(r"\[(?:[^\]]*)\]\((https?://[^\)\s]+)\)", markdown_content):
+                norm = normalize_url(match, final_url)
+                if norm:
+                    discovered_links.append(norm)
+
+            return {
+                "status": "SUCCESS" if status_code == 200 else "ERROR",
+                "http_status": status_code,
+                "title": title,
+                "meta_description": desc,
+                "word_count": word_count,
+                "character_count": len(plain_text),
+                "markdown": markdown_content,
+                "plain_text": plain_text,
+                "rendered_html": f"<pre>{html_lib.escape(markdown_content)}</pre>",
+                "links": discovered_links,
+                "final_url": final_url,
+                "error": None
+            }
+    except Exception as e:
+        logger.warning(f"Jina Reader fetch error for {url}: {e}")
+        return {
+            "status": "ERROR",
+            "http_status": 0,
+            "title": "Crawl Error",
+            "meta_description": "",
+            "word_count": 0,
+            "character_count": 0,
+            "markdown": "",
+            "plain_text": "",
+            "rendered_html": "",
+            "links": [],
+            "final_url": url,
+            "error": {"code": "jina_error", "message": str(e)}
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -718,7 +795,10 @@ class CrawleeWebCrawler:
         if self.config.discover_sitemaps:
             discovered_sitemaps = self.sitemaps.discover(self.robots.sitemaps)
 
-        # 4. Route to Fast Hybrid / HTTP Engine for maximum efficiency
+        # 4. Route to Jina Reader or Fast Hybrid Engine
+        if self.config.crawl_mode == "jina":
+            return await self._crawl_jina(on_page_crawled, start_time, effective_delay, discovered_sitemaps)
+
         if self.config.crawl_mode in ["turbo", "http"]:
             return await self._crawl_fast(on_page_crawled, start_time, effective_delay, discovered_sitemaps)
 
@@ -1171,6 +1251,120 @@ class CrawleeWebCrawler:
         else:
             self.stats["crawl_completion_status"] = "COMPLETED_ALL_DISCOVERED"
             self.stats["completion_message"] = f"Crawl completed! Extracted {len(self.results)} pages in {self.stats['elapsed_seconds']}s."
+
+        return self.results
+
+    async def _crawl_jina(
+        self,
+        on_page_crawled: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]],
+        start_time: float,
+        effective_delay: float,
+        discovered_sitemaps: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Multi-page crawler powered by Jina Reader API (r.jina.ai)."""
+        queue: asyncio.Queue = asyncio.Queue()
+        norm_seed = normalize_url(self.config.seed_url, self.config.seed_url) or self.config.seed_url
+        self.seen_urls.add(norm_seed)
+        await queue.put((norm_seed, 0))
+
+        for s_url in discovered_sitemaps:
+            if s_url not in self.seen_urls and len(self.seen_urls) < self.config.max_pages * 3:
+                self.seen_urls.add(s_url)
+                await queue.put((s_url, 1))
+
+        lock = asyncio.Lock()
+
+        async def worker():
+            while True:
+                if len(self.results) >= self.config.max_pages:
+                    break
+                try:
+                    current_url, depth = await asyncio.wait_for(queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    break
+
+                if len(self.results) >= self.config.max_pages:
+                    queue.task_done()
+                    break
+
+                if effective_delay > 0:
+                    await asyncio.sleep(effective_delay)
+
+                if self.config.respect_robots and not self.robots.can_fetch(current_url):
+                    rec = {
+                        "url": current_url,
+                        "final_url": None,
+                        "status": "SKIPPED_ROBOTS",
+                        "http_status": None,
+                        "title": "Disallowed by robots.txt",
+                        "word_count": 0,
+                        "character_count": 0,
+                        "markdown": "",
+                        "plain_text": "",
+                        "rendered_html": "",
+                        "error": None,
+                        "depth": depth,
+                        "fetch_time_ms": 0.0
+                    }
+                    async with lock:
+                        self.results.append(rec)
+                        self.stats["attempted"] += 1
+                        self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+                    if on_page_crawled:
+                        try:
+                            on_page_crawled(rec, self.stats)
+                        except Exception:
+                            pass
+                    queue.task_done()
+                    continue
+
+                t0 = time.perf_counter()
+                jina_res = await asyncio.to_thread(fetch_jina_reader, current_url, self.config.jina_api_key, self.config.timeout)
+                fetch_time_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                jina_res["fetch_time_ms"] = fetch_time_ms
+                jina_res["depth"] = depth
+                jina_res["url"] = current_url
+
+                status = jina_res["status"]
+                async with lock:
+                    self.results.append(jina_res)
+                    self.stats["attempted"] += 1
+                    if status == "SUCCESS":
+                        self.stats["successful"] += 1
+                        self.stats["total_words"] += jina_res["word_count"]
+                        self.stats["total_bytes"] += len(jina_res["markdown"].encode("utf-8"))
+                    else:
+                        self.stats["failed"] += 1
+                    self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+
+                # Link discovery for deep multi-page crawl
+                if depth < self.config.max_depth and status == "SUCCESS":
+                    for cand_link in jina_res.get("links", []):
+                        if cand_link not in self.seen_urls:
+                            if is_in_scope(cand_link, self.config.seed_url, self.config.allow_subdomains):
+                                safe_l, _ = is_safe_url(cand_link)
+                                if safe_l:
+                                    self.seen_urls.add(cand_link)
+                                    await queue.put((cand_link, depth + 1))
+
+                if on_page_crawled:
+                    try:
+                        on_page_crawled(jina_res, self.stats)
+                    except Exception:
+                        pass
+                queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(max(1, self.config.concurrency))]
+        await asyncio.gather(*workers)
+
+        self.stats["elapsed_seconds"] = round(time.perf_counter() - start_time, 2)
+        remaining = queue.qsize()
+        if len(self.results) >= self.config.max_pages and remaining > 0:
+            self.stats["crawl_completion_status"] = "PARTIAL_LIMIT_REACHED"
+            self.stats["completion_message"] = f"{len(self.results)} pages extracted via Jina Reader. Reached configured limit ({self.config.max_pages})."
+        else:
+            self.stats["crawl_completion_status"] = "COMPLETED_ALL_DISCOVERED"
+            self.stats["completion_message"] = f"Crawl completed! Extracted {len(self.results)} pages via Jina Reader in {self.stats['elapsed_seconds']}s."
 
         return self.results
 

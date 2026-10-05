@@ -69,16 +69,22 @@ with st.expander("⚙️ Advanced Crawl Settings", expanded=False):
     with c_mode:
         crawl_mode_label = st.selectbox(
             "Crawl Speed & Mode",
-            options=["🌐 Full Headless Browser (Playwright)", "⚡ Turbo (Adaptive Hybrid)", "🏎️ Fast HTTP Only"],
+            options=[
+                "⚡ Jina Reader (Fast & Lossless - Recommended)",
+                "🌐 Full Headless Browser (Playwright)",
+                "🏎️ Turbo Adaptive Hybrid",
+                "📄 Fast HTTP Only"
+            ],
             index=0,
-            help="Full Headless Browser uses Playwright Chromium with media/tracker blocking for 100% reliable JS extraction."
+            help="Jina Reader (r.jina.ai) provides instant, clean, lossless Markdown extraction with zero browser overhead."
         )
         mode_mapping = {
+            "⚡ Jina Reader (Fast & Lossless - Recommended)": "jina",
             "🌐 Full Headless Browser (Playwright)": "browser",
-            "⚡ Turbo (Adaptive Hybrid)": "turbo",
-            "🏎️ Fast HTTP Only": "http"
+            "🏎️ Turbo Adaptive Hybrid": "turbo",
+            "📄 Fast HTTP Only": "http"
         }
-        selected_mode = mode_mapping.get(crawl_mode_label, "browser")
+        selected_mode = mode_mapping.get(crawl_mode_label, "jina")
     with c1:
         max_pages = st.number_input("Max Pages", min_value=1, max_value=200, value=10, step=5)
     with c2:
@@ -87,6 +93,12 @@ with st.expander("⚙️ Advanced Crawl Settings", expanded=False):
         concurrency = st.number_input("Concurrency", min_value=1, max_value=8, value=3, step=1)
     with c4:
         request_delay = st.number_input("Delay (s)", min_value=0.0, max_value=3.0, value=0.1, step=0.1)
+
+    jina_api_key = st.text_input(
+        "Jina API Key (Optional for higher rate limits)",
+        type="password",
+        help="Optional: enter your jina.ai API key if crawling large volumes of pages."
+    )
 
 # -----------------------------------------------------------------------------
 # CRAWL EXECUTION
@@ -114,7 +126,8 @@ if extract_clicked:
                 max_depth=int(max_depth),
                 concurrency=int(concurrency),
                 delay=float(request_delay),
-                crawl_mode=selected_mode
+                crawl_mode=selected_mode,
+                jina_api_key=jina_api_key.strip() if jina_api_key else None
             )
 
             crawler = CrawleeWebCrawler(config)
