@@ -416,8 +416,9 @@ def clean_whitespace(text: str) -> str:
 
 def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
     """
-    Extracts 100% complete editorial content without image clutter,
-    cookie consent banners, or broken anchor links.
+    Extracts 100% complete, un-truncated page content without losing editorial sections,
+    product catalogs, case studies, or link directories. Strips only non-text scripts/styles
+    and cookie consent popups.
     """
     if not rendered_html or not rendered_html.strip():
         return {
@@ -446,38 +447,20 @@ def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
     # Build clean DOM tree
     content_soup = BeautifulSoup(rendered_html, "html.parser")
 
-    # Decompose non-content, media, forms, and layout shells
-    for tag in content_soup(["script", "style", "noscript", "svg", "img", "picture", "source", "canvas", "video", "audio", "iframe", "button", "input", "select", "option", "form", "header", "nav", "footer"]):
+    # Decompose only pure non-content/media rendering elements
+    for tag in content_soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
         tag.decompose()
 
     # Remove HTML comments
     for comment in content_soup.find_all(string=lambda s: isinstance(s, Comment)):
         comment.extract()
 
-    # Comprehensive boilerplate removal: mega-menus, drawers, banners, indicators, footers
-    boilerplate_selectors = [
-        # Navigation & Mega-menus
-        "[role='navigation']", "[role='contentinfo']", "[role='banner']",
-        ".mega-menu", ".global-nav", ".navbar", ".navigation", ".site-header", ".site-footer",
-        ".drawer-menu", ".mobile-menu", ".gn-header", ".header-container", ".main-nav",
-        # Cookie Banners & Consent Modals
+    # Strip only invasive cookie consent popups & modal backdrops
+    for sel in [
         "#onetrust-consent-sdk", "#onetrust-banner-sdk", "#onetrust-pc-sdk",
         ".optanon-alert-box-wrapper", ".cookie-banner", ".ot-sdk-container",
-        ".region-selector-modal", ".country-selector", ".region-banner", ".country-banner", ".locale-banner",
-        ".modal-backdrop", "[id*='cookie']", "[id*='consent']", "[class*='cookie']", "[class*='consent']",
-        "[role='dialog']", "[role='alertdialog']", "[aria-modal='true']",
-        # Accessibility skip links
-        ".skip-to-content", ".skip-link", "a[href*='#main']", "a[href*='#content']",
-        # Carousel Indicators & Thumbnail Labels
-        ".cmp-carousel__indicators", ".cmp-carousel__actions", ".cmp-carousel__indicator",
-        ".carousel-indicators", ".swiper-pagination", ".slick-dots", ".slider-nav",
-        # Footer link directories & Copyright blocks
-        "#globalFooter", ".global-footer", ".global-footer-container",
-        ".page-footer", ".page-footer__links", ".page-footer-link-set",
-        "[class*='global-footer']", "[class*='site-footer']", "[class*='page-footer']",
-        "[id*='globalFooter']", "[id*='footer']"
-    ]
-    for sel in boilerplate_selectors:
+        ".modal-backdrop"
+    ]:
         try:
             for el in content_soup.select(sel):
                 el.decompose()
@@ -486,7 +469,7 @@ def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
 
     body = content_soup.find("body") or content_soup
 
-    # Clean links: Keep real destinations, remove empty '#' or javascript links
+    # Clean links: Keep real destinations, unwrap empty '#' or javascript links
     for a in body.find_all("a"):
         href = a.get("href", "").strip()
         link_text = a.get_text(" ", strip=True)
@@ -503,7 +486,7 @@ def extract_exact_content(rendered_html: str, url: str) -> Dict[str, Any]:
         heading_style="ATX",
         bullets_style="-",
         autolinks=False,
-        strip=["img", "picture", "svg", "canvas", "script", "style"]
+        strip=["script", "style", "svg", "canvas"]
     )
     markdown_content = clean_whitespace(markdown_content)
 
@@ -709,8 +692,14 @@ async def render_single_page_playwright(url: str, user_agent: str = USER_AGENT, 
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             status_code = resp.status if resp else 200
             try:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                await asyncio.sleep(0.1)
+                await page.evaluate("""async () => {
+                    const totalHeight = document.body.scrollHeight;
+                    for (let i = 1; i <= 8; i++) {
+                        window.scrollTo(0, (totalHeight * i) / 8);
+                        await new Promise(r => setTimeout(r, 120));
+                    }
+                }""")
+                await asyncio.sleep(0.3)
             except Exception:
                 pass
             content = await page.content()
@@ -894,10 +883,13 @@ class CrawleeWebCrawler:
                 try:
                     await page.wait_for_load_state("domcontentloaded")
                     await page.evaluate("""async () => {
-                        window.scrollTo(0, document.body.scrollHeight / 2);
-                        await new Promise(r => setTimeout(r, 100));
-                        window.scrollTo(0, 0);
+                        const totalHeight = document.body.scrollHeight;
+                        for (let i = 1; i <= 8; i++) {
+                            window.scrollTo(0, (totalHeight * i) / 8);
+                            await new Promise(r => setTimeout(r, 120));
+                        }
                     }""")
+                    await asyncio.sleep(0.3)
                 except Exception:
                     pass
 
